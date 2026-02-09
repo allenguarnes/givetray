@@ -1,0 +1,18 @@
+[package]
+name = "givetray"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+async-channel = "2"
+directories = "5"
+glib = "0.18"
+gtk = "0.18"
+image = { version = "0.25", default-features = false, features = ["png"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+shell-words = "1.1"
+toml = "0.8"
+tray-icon = "0.21"
+zeroize = "1.8"
