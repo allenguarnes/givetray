@@ -3,6 +3,13 @@ name = "givetray"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
+description = "Run terminal commands from the Linux system tray"
+homepage = "https://allenguarnes.com"
+repository = "https://github.com/allenguarnes/givetray"
+readme = "README.md"
+keywords = ["tray", "linux", "gtk", "automation", "command"]
+categories = ["command-line-utilities", "gui"]
+exclude = ["assets/icons/*", ".github/*"]
 
 [dependencies]
 async-channel = "2"
