@@ -1,22 +1,9 @@
 # givetray
 
-`givetray` is a Linux system-tray utility that wraps terminal commands into named profiles.
-Each profile can run one command, stream logs, and manage desktop launcher entries.
+`givetray` runs terminal commands from the Linux system tray using named profiles.
+Each profile can run one command, show live logs, and manage desktop entries.
 
 ![givetray icon](assets/icon.png)
-
-## Quick Start
-
-```bash
-# Run with a required profile name
-cargo run -- -c scrcpy
-
-# Or with release binary
-./target/release/givetray -c scrcpy
-```
-
-On first run, `givetray` creates the profile config if it does not exist.
-Open `Configuration` from the tray menu and set your actual command.
 
 ## Dependencies (Linux)
 
@@ -34,21 +21,31 @@ Arch/Manjaro:
 sudo pacman -S gtk3 xdotool libappindicator-gtk3
 ```
 
-## Install
+## Install and Run
 
-Install from source:
+From source with Cargo:
 
 ```bash
 cargo install --path .
 givetray -c default
 ```
 
-Or build manually:
+From crates.io (after publishing):
+
+```bash
+cargo install givetray
+givetray -c default
+```
+
+Build manually:
 
 ```bash
 cargo build --release
 ./target/release/givetray -c default
 ```
+
+On first run, `givetray` creates `~/.config/givetray/configs/<profile>.toml`.
+Then open `Configuration` from the tray menu and set your command/script.
 
 ## CLI Usage
 
@@ -56,7 +53,7 @@ cargo build --release
 
 ```bash
 givetray -c PROFILE [--icon ICON_PATH] [--log-file LOG_PATH]
-givetray desktop-file -c PROFILE [--output-dir DIR] [--autostart] [--icon ICON_PATH] [--log-file LOG_PATH]
+givetray desktop-file -c PROFILE [--output-dir DIR] [--autostart] [--icon ICON_PATH]
 givetray --help
 givetray --version
 ```
@@ -64,92 +61,67 @@ givetray --version
 Examples:
 
 ```bash
-# Run profile
 givetray -c scrcpy
-
-# Set profile icon (copied into givetray-managed storage)
 givetray -c scrcpy --icon /path/to/icon.png
-
-# Enable file logging for this profile
 givetray -c scrcpy --log-file ~/.local/share/givetray/logs/scrcpy.log
-
-# Create Applications desktop entry
 givetray desktop-file -c scrcpy
-
-# Create autostart desktop entry
 givetray desktop-file -c scrcpy --autostart
-
-# Create desktop entry in custom directory
-givetray desktop-file -c scrcpy --output-dir /tmp
 ```
-
-## Profiles
-
-- Profiles are independent configs so multiple instances can run at once.
-- Config path: `~/.config/givetray/configs/<profile>.toml`
 
 ## Desktop Entries
 
 - Desktop filename format: `givetray_<profile>.desktop`
 - Applications location: `~/.local/share/applications`
 - Autostart location: `~/.config/autostart`
-- CLI default writes to Applications location.
-- `--autostart` switches default target to autostart location.
-- Configuration window toggles can create/remove entries in both locations.
-
-## Sudo Commands
-
-If the configured command starts with `sudo`, `givetray` prompts for password on each Start.
-The password is passed to `sudo` via stdin (`sudo -S`) and is not stored in config.
-
-## Runtime Behavior
-
-- Tray menu order: Start/Stop, Logs, Configuration, About, separator, Exit.
-- One running child process is tracked per app instance.
-- Logs are buffered in memory (`MAX_LOG_LINES`) and can also be written to file.
-- On stop, the process receives `SIGTERM` before a timed kill fallback.
+- `desktop-file` writes to Applications by default
+- `--autostart` switches default target to autostart
+- Configuration toggles can create/remove entries in both locations
 
 ## GUI Features
 
 ### Tray Menu
 
-- `Start/Stop`: starts or stops the configured command for the active profile.
-- `Logs`: opens a live log window.
-- `Configuration`: opens profile configuration controls.
-- `About`: opens project information and support links.
-- `Exit`: stops any running command for this instance and exits.
+- `Start/Stop`: run or stop the configured command
+- `Logs`: open live log window
+- `Configuration`: edit profile command and toggles
+- `About`: show app info and links
+- `Exit`: stop current process and quit this instance
 
 ### Logs Window
 
-- Live stdout/stderr stream from the running command.
-- In-memory rolling buffer with line count indicator.
-- `Copy All` button to copy all log text to clipboard.
-- `Clear` button to clear the in-app log buffer.
-- Optional file logging (if enabled for profile).
+- Live stdout/stderr streaming
+- Rolling in-memory buffer with line count
+- `Copy All` and `Clear` actions
+- Optional file logging per profile
 
 ### Configuration Window
 
-- Editable command/script text field for the profile.
-- `Run command automatically when givetray launches` toggle.
-- `Write logs to file` toggle.
-- `Create Applications launcher (.desktop)` toggle.
-- `Enable desktop session autostart (.config/autostart)` toggle.
-- Save status (`Saved` / `Unsaved changes`) and unsaved-change close prompt.
+- Command/script editor for the active profile
+- Run command on launch toggle
+- Write logs to file toggle
+- Applications entry toggle
+- Session autostart toggle
+- Saved/unsaved status with close confirmation
 
-## Development
+### About Window
 
-```bash
-cargo build
-cargo fmt --all
-cargo clippy --all-targets --all-features
-cargo test
-```
+- App icon, version, author, and license details
+- GitHub link and Buy Me a Coffee link
 
-## Support
+## Sudo Behavior
 
-If `givetray` helps your workflow, you can support development:
+If the configured command starts with `sudo`, `givetray` prompts for password on each Start.
+The password is passed to `sudo` via stdin (`sudo -S`) and is not stored in config.
 
-https://buymeacoffee.com/allenguarnes
+## Contributing
+
+Contributions are welcome.
+
+- Open an issue first for significant changes so scope and approach can be aligned.
+- Keep pull requests focused and include clear reproduction or verification notes.
+
+By submitting a contribution, you agree that your work is licensed under
+`MIT OR Apache-2.0`.
 
 ## License
 
@@ -159,3 +131,9 @@ Licensed under either of:
 - Apache License, Version 2.0 (`LICENSE-APACHE`)
 
 at your option.
+
+## Support
+
+If `givetray` helps your workflow, you can support development:
+
+https://buymeacoffee.com/allenguarnes

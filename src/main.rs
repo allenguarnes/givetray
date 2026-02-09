@@ -566,9 +566,7 @@ fn build_config_window(
     scroller.set_vexpand(true);
     scroller.add(&text_view);
 
-    let hint = gtk::Label::new(Some(
-        "Use the exact terminal command you want to run for this profile.",
-    ));
+    let hint = gtk::Label::new(Some("Enter the terminal command to run for this profile."));
     hint.set_halign(gtk::Align::Start);
     hint.set_xalign(0.0);
     hint.set_margin_start(8);
@@ -590,14 +588,14 @@ fn build_config_window(
         "When enabled, command logs are appended to a profile log file.",
     ));
 
-    let apps_toggle = gtk::CheckButton::with_label("Create Applications launcher (.desktop)");
+    let apps_toggle = gtk::CheckButton::with_label("Create Applications entry (.desktop)");
     apps_toggle.set_halign(gtk::Align::Start);
     apps_toggle.set_tooltip_text(Some(
         "Creates or removes ~/.local/share/applications desktop entry for this profile.",
     ));
 
     let autostart_desktop_toggle =
-        gtk::CheckButton::with_label("Enable desktop session autostart (.config/autostart)");
+        gtk::CheckButton::with_label("Enable desktop session autostart (~/.config/autostart)");
     autostart_desktop_toggle.set_halign(gtk::Align::Start);
     autostart_desktop_toggle.set_tooltip_text(Some(
         "Creates or removes ~/.config/autostart desktop entry for this profile.",
@@ -673,7 +671,7 @@ fn build_about_window(window_icon: Option<&Pixbuf>) -> gtk::Window {
     title.set_halign(gtk::Align::Start);
     title.set_xalign(0.0);
 
-    let subtitle = gtk::Label::new(Some("System tray wrapper for terminal commands"));
+    let subtitle = gtk::Label::new(Some("Run terminal commands from the Linux system tray"));
     subtitle.set_halign(gtk::Align::Start);
     subtitle.set_xalign(0.0);
     subtitle.set_margin_bottom(6);
@@ -701,7 +699,7 @@ fn build_about_window(window_icon: Option<&Pixbuf>) -> gtk::Window {
     description.set_xalign(0.0);
     description.set_line_wrap(true);
 
-    let licenses = gtk::Label::new(Some("License: MIT"));
+    let licenses = gtk::Label::new(Some("License: MIT OR Apache-2.0"));
     licenses.set_halign(gtk::Align::Start);
     licenses.set_xalign(0.0);
     licenses.set_line_wrap(true);
@@ -1351,30 +1349,30 @@ fn apply_desktop_actions(
             if let Err(err) = write_desktop_file(&path, &content) {
                 append_log(
                     &mut state.borrow_mut(),
-                    format!("Failed to add system auto-start entry: {err}"),
+                    format!("Failed to add system autostart entry: {err}"),
                 );
             } else {
                 append_log(
                     &mut state.borrow_mut(),
-                    format!("System auto-start entry updated: {desktop_name}"),
+                    format!("System autostart entry updated: {desktop_name}"),
                 );
             }
         } else if path.exists() {
             match fs::remove_file(&path) {
                 Ok(_) => append_log(
                     &mut state.borrow_mut(),
-                    format!("System auto-start entry removed: {desktop_name}"),
+                    format!("System autostart entry removed: {desktop_name}"),
                 ),
                 Err(err) => append_log(
                     &mut state.borrow_mut(),
-                    format!("Failed to remove system auto-start entry: {err}"),
+                    format!("Failed to remove system autostart entry: {err}"),
                 ),
             }
         }
     } else {
         append_log(
             &mut state.borrow_mut(),
-            "Unable to resolve system auto-start entry path".to_string(),
+            "Unable to resolve system autostart entry path".to_string(),
         );
     }
 
