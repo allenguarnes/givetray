@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxdo-dev libappindicator3-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Prepare release artifacts
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          ARCHIVE="givetray-${VERSION}-linux-x86_64.tar.gz"
+
+          mkdir -p dist/givetray
+          cp target/release/givetray dist/givetray/
+          cp README.md dist/givetray/
+          cp LICENSE-MIT dist/givetray/
+          cp LICENSE-APACHE dist/givetray/
+
+          tar -czf "${ARCHIVE}" -C dist/givetray givetray README.md LICENSE-MIT LICENSE-APACHE
+          sha256sum "${ARCHIVE}" > SHA256SUMS
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            givetray-${{ github.ref_name }}-linux-x86_64.tar.gz
+            SHA256SUMS
+          generate_release_notes: true
