@@ -23,17 +23,17 @@ sudo pacman -S gtk3 xdotool libappindicator-gtk3
 
 ## Install and Run
 
+From crates.io (recommended):
+
+```bash
+cargo install givetray
+givetray -c default
+```
+
 From source with Cargo:
 
 ```bash
 cargo install --path .
-givetray -c default
-```
-
-From crates.io (after publishing):
-
-```bash
-cargo install givetray
 givetray -c default
 ```
 
@@ -102,11 +102,6 @@ givetray desktop-file -c scrcpy --autostart
 - Applications entry toggle
 - Session autostart toggle
 - Saved/unsaved status with close confirmation
-
-### About Window
-
-- App icon, version, author, and license details
-- GitHub link and Buy Me a Coffee link
 
 ## Sudo Behavior
 
