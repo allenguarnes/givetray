@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::env;
-use std::ffi::OsString;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 #[cfg(unix)]
@@ -27,6 +26,8 @@ const DEFAULT_PROFILE: &str = "default";
 const DEFAULT_COMMAND: &str = "echo configure command";
 const MAX_LOG_LINES: usize = 5000;
 const MAX_UNDO: usize = 200;
+const MAX_COMMAND_LENGTH: usize = 8192;
+const MAX_PROFILE_LENGTH: usize = 128;
 const ICON_FILE_NAME: &str = "icon.png";
 const BUNDLED_ICON_FILE_NAME: &str = "default-icon.png";
 const BG_CHILD_ENV: &str = "GIVETRAY_BG_CHILD";
@@ -34,6 +35,7 @@ const BG_CHILD_ENV: &str = "GIVETRAY_BG_CHILD";
 #[derive(Debug, Clone)]
 struct CliOptions {
     profile: String,
+    command_override: Option<String>,
     icon_source: Option<PathBuf>,
     log_file: Option<PathBuf>,
     mode: CliMode,
@@ -127,36 +129,27 @@ fn main() {
         CliMode::Run => {}
     }
 
-    if let Err(err) = detach_to_background_if_needed() {
-        eprintln!("failed to start background instance: {err}");
-        process::exit(1);
-    }
-
     let config_path =
         config_path_for_profile(&cli.profile).expect("failed to resolve configuration path");
     let mut config = load_or_create_config(&config_path);
 
-    if let Some(source_path) = cli.icon_source.as_ref() {
-        match copy_icon_to_profile(source_path, &cli.profile) {
-            Ok(stored_path) => {
-                config.icon_path = Some(stored_path.to_string_lossy().to_string());
-                save_config(&config_path, &config);
+    match apply_cli_overrides_to_config(&mut config, &cli) {
+        Ok(true) => {
+            if let Err(err) = save_config(&config_path, &config) {
+                eprintln!("failed to save config overrides: {err}");
+                process::exit(1);
             }
-            Err(err) => eprintln!("failed to set icon: {err}"),
+        }
+        Ok(false) => {}
+        Err(err) => {
+            eprintln!("failed to apply CLI overrides: {err}");
+            process::exit(1);
         }
     }
 
-    if let Some(log_file) = cli.log_file.as_ref() {
-        config.log_to_file = true;
-        config.log_file_path = Some(log_file.to_string_lossy().to_string());
-        save_config(&config_path, &config);
-    }
-
-    if config.log_to_file && config.log_file_path.is_none() {
-        if let Some(default_path) = default_log_file_path(&cli.profile) {
-            config.log_file_path = Some(default_path.to_string_lossy().to_string());
-            save_config(&config_path, &config);
-        }
+    if let Err(err) = detach_to_background_if_needed(&cli.profile) {
+        eprintln!("failed to start background instance: {err}");
+        process::exit(1);
     }
 
     let log_file_path = resolve_log_file_path(&cli.profile, &config);
@@ -299,7 +292,7 @@ fn main() {
     gtk::main();
 }
 
-fn detach_to_background_if_needed() -> Result<(), String> {
+fn detach_to_background_if_needed(profile: &str) -> Result<(), String> {
     if env::var_os(BG_CHILD_ENV).is_some() {
         return Ok(());
     }
@@ -310,11 +303,11 @@ fn detach_to_background_if_needed() -> Result<(), String> {
 
     let executable =
         env::current_exe().map_err(|err| format!("unable to resolve executable path: {err}"))?;
-    let args: Vec<OsString> = env::args_os().skip(1).collect();
 
     let mut command = Command::new(executable);
     command
-        .args(args)
+        .arg("--config")
+        .arg(profile)
         .env(BG_CHILD_ENV, "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -373,6 +366,7 @@ fn parse_cli_args() -> Result<CliOptions, String> {
     }
 
     let mut profile: Option<String> = None;
+    let mut command_override: Option<String> = None;
     let mut icon_source = None;
     let mut log_file = None;
 
@@ -382,8 +376,21 @@ fn parse_cli_args() -> Result<CliOptions, String> {
             "-c" | "--config" => {
                 let value = args
                     .get(i + 1)
-                    .ok_or_else(|| "missing value for --config".to_string())?;
-                profile = Some(sanitize_profile_name(value));
+                    .ok_or_else(|| "missing value for -c/--config".to_string())?;
+                if profile.is_some() {
+                    return Err("-c/--config provided more than once".to_string());
+                }
+                profile = Some(validate_profile_name(value)?);
+                i += 2;
+            }
+            "-cmd" | "--command" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "missing value for -cmd/--command".to_string())?;
+                if command_override.is_some() {
+                    return Err("-cmd/--command provided more than once".to_string());
+                }
+                command_override = Some(validate_command_override(value)?);
                 i += 2;
             }
             "--icon" => {
@@ -397,6 +404,9 @@ fn parse_cli_args() -> Result<CliOptions, String> {
                 let value = args
                     .get(i + 1)
                     .ok_or_else(|| "missing value for --log-file".to_string())?;
+                if matches!(mode, CliMode::DesktopFile { .. }) {
+                    return Err("--log-file is only valid in app mode".to_string());
+                }
                 log_file = Some(PathBuf::from(value));
                 i += 2;
             }
@@ -440,6 +450,7 @@ fn parse_cli_args() -> Result<CliOptions, String> {
 
     Ok(CliOptions {
         profile,
+        command_override,
         icon_source,
         log_file,
         mode,
@@ -448,13 +459,91 @@ fn parse_cli_args() -> Result<CliOptions, String> {
 
 fn print_help() {
     println!(
-        "{name}\n\nUsage:\n  {name} -c PROFILE [--icon ICON_PATH] [--log-file LOG_PATH]\n  {name} desktop-file -c PROFILE [--output-dir DIR] [--autostart] [--icon ICON_PATH]\n\nOptions:\n  -c, --config PROFILE   Required profile name to load or create\n      --icon ICON_PATH   Copy icon into the selected profile and update config\n      --log-file LOG_PATH  Enable log-to-file and set output path\n      --output-dir DIR   Output directory for desktop file (desktop-file mode only)\n      --autostart        Mark desktop file as autostart and default to ~/.config/autostart\n  -h, --help             Show this help\n  -V, --version          Show version\n",
+        "{name}\n\nUsage:\n  {name} -c PROFILE [-cmd COMMAND|--command COMMAND] [--icon ICON_PATH] [--log-file LOG_PATH]\n  {name} desktop-file -c PROFILE [-cmd COMMAND|--command COMMAND] [--output-dir DIR] [--autostart] [--icon ICON_PATH]\n\nOptions:\n  -c, --config PROFILE    Required profile name (letters, numbers, '-' or '_')\n  -cmd, --command COMMAND Set or overwrite saved command for the profile\n      --icon ICON_PATH    Copy icon into the selected profile and update config\n      --log-file LOG_PATH Enable log-to-file and set output path (app mode only)\n      --output-dir DIR    Output directory for desktop file (desktop-file mode only)\n      --autostart         Mark desktop file as autostart and default to ~/.config/autostart\n  -h, --help              Show this help\n  -V, --version           Show version\n",
         name = APP_NAME,
     );
 }
 
 fn print_version() {
     println!("{APP_NAME} {}", env!("CARGO_PKG_VERSION"));
+}
+
+fn validate_profile_name(raw: &str) -> Result<String, String> {
+    let profile = raw.trim();
+    if profile.is_empty() {
+        return Err("profile cannot be empty".to_string());
+    }
+    if profile.len() > MAX_PROFILE_LENGTH {
+        return Err(format!(
+            "profile is too long (max {MAX_PROFILE_LENGTH} characters)"
+        ));
+    }
+    if !profile
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return Err("invalid profile name: use only letters, numbers, '-' or '_'".to_string());
+    }
+    Ok(profile.to_string())
+}
+
+fn validate_command_override(raw: &str) -> Result<String, String> {
+    let command = raw.trim();
+    if command.is_empty() {
+        return Err("command cannot be empty".to_string());
+    }
+    if command.len() > MAX_COMMAND_LENGTH {
+        return Err(format!(
+            "command is too long (max {MAX_COMMAND_LENGTH} characters)"
+        ));
+    }
+    if command.contains('\0') {
+        return Err("command contains invalid null bytes".to_string());
+    }
+
+    match shell_words::split(command) {
+        Ok(parts) if !parts.is_empty() => Ok(command.to_string()),
+        Ok(_) => Err("command cannot be empty".to_string()),
+        Err(err) => Err(format!("invalid -cmd/--command value: {err}")),
+    }
+}
+
+fn apply_cli_overrides_to_config(config: &mut Config, cli: &CliOptions) -> Result<bool, String> {
+    let mut changed = false;
+
+    if let Some(command) = cli.command_override.as_ref() {
+        if config.command != *command {
+            config.command = command.clone();
+            changed = true;
+        }
+    }
+
+    if let Some(source_path) = cli.icon_source.as_ref() {
+        let copied_path = copy_icon_to_profile(source_path, &cli.profile)?;
+        let copied_path = copied_path.to_string_lossy().to_string();
+        if config.icon_path.as_deref() != Some(copied_path.as_str()) {
+            config.icon_path = Some(copied_path);
+            changed = true;
+        }
+    }
+
+    if let Some(log_file) = cli.log_file.as_ref() {
+        let log_file = log_file.to_string_lossy().to_string();
+        if !config.log_to_file || config.log_file_path.as_deref() != Some(log_file.as_str()) {
+            config.log_to_file = true;
+            config.log_file_path = Some(log_file);
+            changed = true;
+        }
+    }
+
+    if config.log_to_file && config.log_file_path.is_none() {
+        if let Some(default_path) = default_log_file_path(&cli.profile) {
+            config.log_file_path = Some(default_path.to_string_lossy().to_string());
+            changed = true;
+        }
+    }
+
+    Ok(changed)
 }
 
 fn create_desktop_file_from_cli(
@@ -466,16 +555,9 @@ fn create_desktop_file_from_cli(
         .ok_or_else(|| "unable to resolve configuration path".to_string())?;
     let mut config = load_or_create_config(&config_path);
 
-    if let Some(source_path) = cli.icon_source.as_ref() {
-        let copied_path = copy_icon_to_profile(source_path, &cli.profile)?;
-        config.icon_path = Some(copied_path.to_string_lossy().to_string());
-        save_config(&config_path, &config);
-    }
-
-    if let Some(log_file) = cli.log_file.as_ref() {
-        config.log_to_file = true;
-        config.log_file_path = Some(log_file.to_string_lossy().to_string());
-        save_config(&config_path, &config);
+    if apply_cli_overrides_to_config(&mut config, cli)? {
+        save_config(&config_path, &config)
+            .map_err(|err| format!("failed to save config overrides: {err}"))?;
     }
 
     let exec_path = env::current_exe()
@@ -1034,13 +1116,15 @@ fn save_from_config_widgets(
     system_autostart_toggle: &gtk::CheckButton,
 ) {
     let text = buffer_text(buffer);
-    save_configuration(state.clone(), text, log_to_file_toggle.is_active());
-    apply_desktop_actions(
-        state.clone(),
-        apps_toggle.is_active(),
-        system_autostart_toggle.is_active(),
-    );
-    refresh_desktop_toggles(state.clone(), apps_toggle, system_autostart_toggle);
+    let saved = save_configuration(state.clone(), text, log_to_file_toggle.is_active());
+    if saved {
+        apply_desktop_actions(
+            state.clone(),
+            apps_toggle.is_active(),
+            system_autostart_toggle.is_active(),
+        );
+        refresh_desktop_toggles(state.clone(), apps_toggle, system_autostart_toggle);
+    }
     refresh_config_dirty_status(state);
 }
 
@@ -1274,40 +1358,56 @@ fn setup_process_watcher(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>) {
     });
 }
 
-fn save_configuration(state: Rc<RefCell<AppState>>, text: String, log_to_file_enabled: bool) {
+fn save_configuration(
+    state: Rc<RefCell<AppState>>,
+    text: String,
+    log_to_file_enabled: bool,
+) -> bool {
     let mut state = state.borrow_mut();
-    state.command = text.clone();
-    state.config_last = text.clone();
-    state.saved_command = text.clone();
-    state.saved_autostart = state.config_autostart.is_active();
-    state.saved_log_to_file = log_to_file_enabled;
-    if log_to_file_enabled && state.saved_log_file_path.is_none() {
-        state.saved_log_file_path =
+    let new_autostart = state.config_autostart.is_active();
+    let mut new_log_file_path = state.saved_log_file_path.clone();
+    if log_to_file_enabled && new_log_file_path.is_none() {
+        new_log_file_path =
             default_log_file_path(&state.profile).map(|path| path.to_string_lossy().to_string());
     }
+    let new_config = Config {
+        command: text.clone(),
+        autostart: new_autostart,
+        icon_path: state.saved_icon_path.clone(),
+        log_to_file: log_to_file_enabled,
+        log_file_path: new_log_file_path.clone(),
+    };
+
+    if let Err(err) = save_config(&state.config_path, &new_config) {
+        append_log(&mut state, format!("Failed to save configuration: {err}"));
+        return false;
+    }
+
+    state.command = text.clone();
+    state.config_last = text.clone();
+    state.saved_command = text;
+    state.saved_autostart = new_autostart;
+    state.saved_log_to_file = log_to_file_enabled;
+    state.saved_log_file_path = new_log_file_path;
     state.log_file_path = if log_to_file_enabled {
         state.saved_log_file_path.as_ref().map(PathBuf::from)
     } else {
         None
     };
-    save_config(
-        &state.config_path,
-        &Config {
-            command: text,
-            autostart: state.saved_autostart,
-            icon_path: state.saved_icon_path.clone(),
-            log_to_file: state.saved_log_to_file,
-            log_file_path: state.saved_log_file_path.clone(),
-        },
-    );
+
+    let saved_log_file_path = state.saved_log_file_path.clone();
+    let saved_log_to_file = state.saved_log_to_file;
+
     append_log(&mut state, "Configuration updated".to_string());
-    if state.saved_log_to_file {
-        if let Some(path) = state.saved_log_file_path.clone() {
+    if saved_log_to_file {
+        if let Some(path) = saved_log_file_path {
             append_log(&mut state, format!("Log file enabled: {path}"));
         }
     } else {
         append_log(&mut state, "Log file output disabled".to_string());
     }
+
+    true
 }
 
 fn refresh_desktop_toggles(
@@ -1439,7 +1539,12 @@ fn apply_desktop_actions(
     }
 
     let config = load_or_create_config(&config_path);
-    save_config(&config_path, &config);
+    if let Err(err) = save_config(&config_path, &config) {
+        append_log(
+            &mut state.borrow_mut(),
+            format!("Failed to sync configuration file: {err}"),
+        );
+    }
 }
 
 fn applications_desktop_path(profile: &str) -> Option<PathBuf> {
@@ -1497,7 +1602,12 @@ fn load_or_create_config(path: &PathBuf) -> Config {
     let content = match fs::read_to_string(path) {
         Ok(data) => data,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            save_config(path, &default);
+            if let Err(save_err) = save_config(path, &default) {
+                eprintln!(
+                    "failed to initialize default config at {}: {save_err}",
+                    path.display()
+                );
+            }
             return default;
         }
         Err(err) => {
@@ -1515,22 +1625,15 @@ fn load_or_create_config(path: &PathBuf) -> Config {
     }
 }
 
-fn save_config(path: &PathBuf, config: &Config) {
+fn save_config(path: &PathBuf, config: &Config) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        if let Err(err) = fs::create_dir_all(parent) {
-            eprintln!("failed to create config dir: {err}");
-            return;
-        }
+        fs::create_dir_all(parent).map_err(|err| format!("failed to create config dir: {err}"))?;
     }
 
-    match toml::to_string_pretty(config) {
-        Ok(payload) => {
-            if let Err(err) = fs::write(path, payload) {
-                eprintln!("failed to write config: {err}");
-            }
-        }
-        Err(err) => eprintln!("failed to serialize config: {err}"),
-    }
+    let payload = toml::to_string_pretty(config)
+        .map_err(|err| format!("failed to serialize config: {err}"))?;
+    fs::write(path, payload).map_err(|err| format!("failed to write config: {err}"))?;
+    Ok(())
 }
 
 fn sanitize_profile_name(profile: &str) -> String {
@@ -1643,7 +1746,7 @@ fn desktop_entry(exec_path: &Path, icon_path: &Path, profile: &str, autostart: b
     entry.push_str(&format!("Name={display_name}\n"));
 
     let exec = format!(
-        "{} -c {}",
+        "{} --config {}",
         desktop_escape_arg(&exec_path.to_string_lossy()),
         desktop_escape_arg(profile)
     );

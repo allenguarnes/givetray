@@ -51,10 +51,11 @@ When launched from a terminal, `givetray` detaches to the background and returns
 ## CLI Usage
 
 `-c/--config PROFILE` is required for app mode and desktop-file mode.
+Profile names support letters, numbers, `-`, and `_`.
 
 ```bash
-givetray -c PROFILE [--icon ICON_PATH] [--log-file LOG_PATH]
-givetray desktop-file -c PROFILE [--output-dir DIR] [--autostart] [--icon ICON_PATH]
+givetray -c PROFILE [-cmd COMMAND|--command COMMAND] [--icon ICON_PATH] [--log-file LOG_PATH]
+givetray desktop-file -c PROFILE [-cmd COMMAND|--command COMMAND] [--output-dir DIR] [--autostart] [--icon ICON_PATH]
 givetray --help
 givetray --version
 ```
@@ -63,11 +64,14 @@ Examples:
 
 ```bash
 givetray -c scrcpy
+givetray -c scrcpy -cmd "scrcpy --always-on-top -S -w"
 givetray -c scrcpy --icon /path/to/icon.png
 givetray -c scrcpy --log-file ~/.local/share/givetray/logs/scrcpy.log
 givetray desktop-file -c scrcpy
 givetray desktop-file -c scrcpy --autostart
 ```
+
+When `-cmd/--command` is provided, the profile's saved command is overwritten.
 
 ## Desktop Entries
 
