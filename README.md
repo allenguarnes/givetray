@@ -46,6 +46,7 @@ cargo build --release
 
 On first run, `givetray` creates `~/.config/givetray/configs/<profile>.toml`.
 Then open `Configuration` from the tray menu and set your command/script.
+When launched from a terminal, `givetray` detaches to the background and returns control to the shell.
 
 ## CLI Usage
 

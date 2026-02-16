@@ -8,8 +8,11 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::env;
+use std::ffi::OsString;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Child, Command, Stdio};
 use std::rc::Rc;
@@ -26,6 +29,7 @@ const MAX_LOG_LINES: usize = 5000;
 const MAX_UNDO: usize = 200;
 const ICON_FILE_NAME: &str = "icon.png";
 const BUNDLED_ICON_FILE_NAME: &str = "default-icon.png";
+const BG_CHILD_ENV: &str = "GIVETRAY_BG_CHILD";
 
 #[derive(Debug, Clone)]
 struct CliOptions {
@@ -121,6 +125,11 @@ fn main() {
             return;
         }
         CliMode::Run => {}
+    }
+
+    if let Err(err) = detach_to_background_if_needed() {
+        eprintln!("failed to start background instance: {err}");
+        process::exit(1);
     }
 
     let config_path =
@@ -288,6 +297,59 @@ fn main() {
     }
 
     gtk::main();
+}
+
+fn detach_to_background_if_needed() -> Result<(), String> {
+    if env::var_os(BG_CHILD_ENV).is_some() {
+        return Ok(());
+    }
+
+    if !should_detach_for_terminal_launch() {
+        return Ok(());
+    }
+
+    let executable =
+        env::current_exe().map_err(|err| format!("unable to resolve executable path: {err}"))?;
+    let args: Vec<OsString> = env::args_os().skip(1).collect();
+
+    let mut command = Command::new(executable);
+    command
+        .args(args)
+        .env(BG_CHILD_ENV, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(unix)]
+    {
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("unable to spawn detached process: {err}"))?;
+
+    thread::sleep(Duration::from_millis(120));
+    if let Ok(Some(status)) = child.try_wait() {
+        return Err(format!("detached process exited early: {status}"));
+    }
+
+    process::exit(0);
+}
+
+fn should_detach_for_terminal_launch() -> bool {
+    unsafe {
+        libc::isatty(libc::STDIN_FILENO) == 1
+            || libc::isatty(libc::STDOUT_FILENO) == 1
+            || libc::isatty(libc::STDERR_FILENO) == 1
+    }
 }
 
 fn parse_cli_args() -> Result<CliOptions, String> {
@@ -1715,6 +1777,7 @@ fn start_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>) {
     };
 
     let mut cmd = Command::new(&args[0]);
+    cmd.env_remove(BG_CHILD_ENV);
     if args.len() > 1 {
         cmd.args(&args[1..]);
     }
