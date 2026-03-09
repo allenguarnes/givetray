@@ -34,11 +34,33 @@ const BG_CHILD_ENV: &str = "GIVETRAY_BG_CHILD";
 
 #[derive(Debug, Clone)]
 struct CliOptions {
-    profile: String,
+    run_target: CliRunTarget,
     command_override: Option<String>,
     icon_source: Option<PathBuf>,
     log_file: Option<PathBuf>,
     mode: CliMode,
+}
+
+impl CliOptions {
+    fn persistent_profile(&self) -> Option<&str> {
+        match &self.run_target {
+            CliRunTarget::PersistentProfile { profile } => Some(profile),
+            CliRunTarget::EphemeralArgv { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum CliRequest {
+    Run(CliOptions),
+    PrintHelp,
+    PrintVersion,
+}
+
+#[derive(Debug, Clone)]
+enum CliRunTarget {
+    PersistentProfile { profile: String },
+    EphemeralArgv { argv: Vec<String> },
 }
 
 #[derive(Debug, Clone)]
@@ -70,7 +92,7 @@ enum UiEvent {
 }
 
 struct AppState {
-    profile: String,
+    persistent_config_access: Option<PersistentConfigAccess>,
     command: String,
     saved_command: String,
     saved_autostart: bool,
@@ -103,17 +125,38 @@ struct AppState {
     config_last: String,
     config_ignore: bool,
     start_stop_item: MenuItem,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PersistentConfigAccess {
+    profile: String,
     config_path: PathBuf,
+}
+
+struct StartupState {
+    profile_label: String,
+    persistent_config_access: Option<PersistentConfigAccess>,
+    config: Config,
+    log_file_path: Option<PathBuf>,
+    launch_on_startup: bool,
 }
 
 fn main() {
     install_log_filters();
 
-    let cli = parse_cli_args().unwrap_or_else(|err| {
+    let cli = match parse_cli_args() {
+        Ok(cli) => cli,
+        Err(err) => {
+            eprintln!("{err}");
+            print_help();
+            process::exit(2);
+        }
+    };
+
+    if let Err(err) = validate_runtime_mode(&cli) {
         eprintln!("{err}");
-        print_help();
-        process::exit(2);
-    });
+        process::exit(1);
+    }
 
     match cli.mode.clone() {
         CliMode::DesktopFile {
@@ -129,35 +172,18 @@ fn main() {
         CliMode::Run => {}
     }
 
-    let config_path =
-        config_path_for_profile(&cli.profile).expect("failed to resolve configuration path");
-    let mut config = load_or_create_config(&config_path);
-
-    match apply_cli_overrides_to_config(&mut config, &cli) {
-        Ok(true) => {
-            if let Err(err) = save_config(&config_path, &config) {
-                eprintln!("failed to save config overrides: {err}");
-                process::exit(1);
-            }
-        }
-        Ok(false) => {}
+    let startup = match prepare_run_startup(&cli) {
+        Ok(startup) => startup,
         Err(err) => {
-            eprintln!("failed to apply CLI overrides: {err}");
+            eprintln!("failed to prepare app startup: {err}");
             process::exit(1);
         }
-    }
-
-    if let Err(err) = detach_to_background_if_needed(&cli.profile) {
-        eprintln!("failed to start background instance: {err}");
-        process::exit(1);
-    }
-
-    let log_file_path = resolve_log_file_path(&cli.profile, &config);
+    };
 
     gtk::init().expect("failed to initialize GTK");
     install_css();
 
-    let window_icon = load_window_icon_pixbuf(&config);
+    let window_icon = load_window_icon_pixbuf(&startup.config);
     if let Some(icon) = window_icon.as_ref() {
         gtk::Window::set_default_icon(icon);
     }
@@ -181,10 +207,10 @@ fn main() {
         config_save_button,
         config_status_label,
     ) = build_config_window(
-        &cli.profile,
-        &config.command,
-        config.autostart,
-        config.log_to_file,
+        &startup.profile_label,
+        &startup.config.command,
+        startup.config.autostart,
+        startup.config.log_to_file,
     );
     let about_window = build_about_window(window_icon.as_ref());
 
@@ -213,17 +239,19 @@ fn main() {
         .append(&start_stop_item)
         .expect("menu append failed");
     tray_menu.append(&logs_item).expect("menu append failed");
-    tray_menu
-        .append(&configure_item)
-        .expect("menu append failed");
+    if should_expose_configuration(startup.persistent_config_access.as_ref()) {
+        tray_menu
+            .append(&configure_item)
+            .expect("menu append failed");
+    }
     tray_menu.append(&about_item).expect("menu append failed");
     tray_menu
         .append(&PredefinedMenuItem::separator())
         .expect("menu append failed");
     tray_menu.append(&exit_item).expect("menu append failed");
 
-    let tray_icon = load_tray_icon(&config).expect("failed to load tray icon");
-    let tooltip = format!("{APP_NAME} ({})", cli.profile);
+    let tray_icon = load_tray_icon(&startup.config).expect("failed to load tray icon");
+    let tooltip = tray_tooltip(&cli.run_target);
     let _tray = TrayIconBuilder::new()
         .with_menu(Box::new(tray_menu))
         .with_tooltip(&tooltip)
@@ -232,16 +260,16 @@ fn main() {
         .expect("failed to create tray icon");
 
     let state = Rc::new(RefCell::new(AppState {
-        profile: cli.profile,
-        command: config.command.clone(),
-        saved_command: config.command.clone(),
-        saved_autostart: config.autostart,
-        saved_icon_path: config.icon_path.clone(),
-        saved_log_to_file: config.log_to_file,
-        saved_log_file_path: config.log_file_path.clone(),
+        persistent_config_access: startup.persistent_config_access,
+        command: startup.config.command.clone(),
+        saved_command: startup.config.command.clone(),
+        saved_autostart: startup.config.autostart,
+        saved_icon_path: startup.config.icon_path.clone(),
+        saved_log_to_file: startup.config.log_to_file,
+        saved_log_file_path: startup.config.log_file_path.clone(),
         child: None,
         log_lines: VecDeque::new(),
-        log_file_path,
+        log_file_path: startup.log_file_path,
         logs_window,
         logs_view,
         logs_buffer,
@@ -262,13 +290,12 @@ fn main() {
         config_saved_system_autostart: false,
         config_undo: Vec::new(),
         config_redo: Vec::new(),
-        config_last: config.command,
+        config_last: startup.config.command,
         config_ignore: false,
         start_stop_item,
-        config_path,
     }));
 
-    {
+    if state.borrow().persistent_config_access.is_some() {
         let (apps_toggle, system_autostart_toggle) = {
             let app = state.borrow();
             (
@@ -277,22 +304,21 @@ fn main() {
             )
         };
         refresh_desktop_toggles(state.clone(), &apps_toggle, &system_autostart_toggle);
+        setup_config_handlers(state.clone());
     }
-
-    setup_config_handlers(state.clone());
     setup_logs_handlers(state.clone());
     setup_log_receiver(state.clone(), ui_rx);
     setup_menu_polling(state.clone(), ui_tx.clone());
     setup_process_watcher(state.clone(), ui_tx.clone());
 
-    if config.autostart {
+    if startup.launch_on_startup {
         start_command(state.clone(), ui_tx);
     }
 
     gtk::main();
 }
 
-fn detach_to_background_if_needed(profile: &str) -> Result<(), String> {
+fn detach_to_background_if_needed(cli: &CliOptions) -> Result<(), String> {
     if env::var_os(BG_CHILD_ENV).is_some() {
         return Ok(());
     }
@@ -306,8 +332,7 @@ fn detach_to_background_if_needed(profile: &str) -> Result<(), String> {
 
     let mut command = Command::new(executable);
     command
-        .arg("--config")
-        .arg(profile)
+        .args(build_detached_args(cli))
         .env(BG_CHILD_ENV, "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -337,6 +362,139 @@ fn detach_to_background_if_needed(profile: &str) -> Result<(), String> {
     process::exit(0);
 }
 
+fn build_detached_args(cli: &CliOptions) -> Vec<String> {
+    match &cli.run_target {
+        CliRunTarget::PersistentProfile { profile } => {
+            let mut args = vec!["--config".to_string(), profile.clone()];
+            if let Some(command_override) = &cli.command_override {
+                args.push("--command".to_string());
+                args.push(command_override.clone());
+            }
+            if let Some(icon_source) = &cli.icon_source {
+                args.push("--icon".to_string());
+                args.push(icon_source.display().to_string());
+            }
+            if let Some(log_file) = &cli.log_file {
+                args.push("--log-file".to_string());
+                args.push(log_file.display().to_string());
+            }
+            args
+        }
+        CliRunTarget::EphemeralArgv { argv } => {
+            let mut args = Vec::with_capacity(argv.len() + 1);
+            args.push("--".to_string());
+            args.extend(argv.iter().cloned());
+            args
+        }
+    }
+}
+
+fn tray_tooltip(run_target: &CliRunTarget) -> String {
+    format!("{APP_NAME} ({})", run_target_label(run_target))
+}
+
+fn run_target_label(run_target: &CliRunTarget) -> String {
+    match run_target {
+        CliRunTarget::PersistentProfile { profile } => profile.clone(),
+        CliRunTarget::EphemeralArgv { .. } => "ephemeral".to_string(),
+    }
+}
+
+fn persistent_config_access(
+    profile: Option<String>,
+    config_path: Option<PathBuf>,
+) -> Option<PersistentConfigAccess> {
+    match (profile, config_path) {
+        (Some(profile), Some(config_path)) => Some(PersistentConfigAccess {
+            profile,
+            config_path,
+        }),
+        _ => None,
+    }
+}
+
+fn should_expose_configuration(access: Option<&PersistentConfigAccess>) -> bool {
+    access.is_some()
+}
+
+fn ephemeral_command_text(argv: &[String]) -> String {
+    argv.iter()
+        .map(|arg| shell_command_token(arg))
+        .collect::<Vec<String>>()
+        .join(" ")
+}
+
+fn shell_command_token(arg: &str) -> String {
+    if !arg.is_empty()
+        && arg
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '/' | '.' | '=' | ':'))
+    {
+        return arg.to_string();
+    }
+
+    let escaped = arg.replace('\'', "'\"'\"'");
+    format!("'{escaped}'")
+}
+
+fn ephemeral_runtime_config(argv: &[String]) -> Config {
+    Config {
+        command: ephemeral_command_text(argv),
+        autostart: false,
+        icon_path: None,
+        log_to_file: false,
+        log_file_path: None,
+    }
+}
+
+fn build_startup_state(cli: &CliOptions) -> Result<StartupState, String> {
+    match &cli.run_target {
+        CliRunTarget::PersistentProfile { profile } => {
+            let config_path = config_path_for_profile(profile)
+                .ok_or_else(|| "failed to resolve configuration path".to_string())?;
+            let mut config = load_or_create_config(&config_path);
+
+            match apply_cli_overrides_to_config(&mut config, cli) {
+                Ok(true) => save_config(&config_path, &config)
+                    .map_err(|err| format!("failed to save config overrides: {err}"))?,
+                Ok(false) => {}
+                Err(err) => return Err(format!("failed to apply CLI overrides: {err}")),
+            }
+
+            Ok(StartupState {
+                profile_label: profile.clone(),
+                persistent_config_access: persistent_config_access(
+                    Some(profile.clone()),
+                    Some(config_path),
+                ),
+                log_file_path: resolve_log_file_path(profile, &config),
+                launch_on_startup: config.autostart,
+                config,
+            })
+        }
+        CliRunTarget::EphemeralArgv { argv } => Ok(StartupState {
+            profile_label: run_target_label(&cli.run_target),
+            persistent_config_access: None,
+            config: ephemeral_runtime_config(argv),
+            log_file_path: None,
+            launch_on_startup: true,
+        }),
+    }
+}
+
+fn prepare_run_startup(cli: &CliOptions) -> Result<StartupState, String> {
+    prepare_run_startup_with(cli, detach_to_background_if_needed)
+}
+
+fn prepare_run_startup_with<F>(cli: &CliOptions, detach: F) -> Result<StartupState, String>
+where
+    F: FnOnce(&CliOptions) -> Result<(), String>,
+{
+    let startup = build_startup_state(cli)?;
+    detach(cli).map_err(|err| format!("failed to start background instance: {err}"))?;
+    Ok(startup)
+}
+
 fn should_detach_for_terminal_launch() -> bool {
     unsafe {
         libc::isatty(libc::STDIN_FILENO) == 1
@@ -345,15 +503,147 @@ fn should_detach_for_terminal_launch() -> bool {
     }
 }
 
-fn parse_cli_args() -> Result<CliOptions, String> {
-    let mut args: Vec<String> = env::args().skip(1).collect();
-    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
-        print_help();
-        process::exit(0);
+fn command_file_name(arg: &str) -> Option<&str> {
+    Path::new(arg).file_name().and_then(|name| name.to_str())
+}
+
+fn sudo_option_takes_value(arg: &str) -> bool {
+    matches!(
+        arg,
+        "-C" | "-D"
+            | "-R"
+            | "-T"
+            | "-U"
+            | "-g"
+            | "-h"
+            | "-p"
+            | "-r"
+            | "-t"
+            | "-u"
+            | "--chdir"
+            | "--chroot"
+            | "--close-from"
+            | "--command-timeout"
+            | "--group"
+            | "--host"
+            | "--other-user"
+            | "--prompt"
+            | "--role"
+            | "--type"
+            | "--user"
+    )
+}
+
+fn is_environment_assignment(arg: &str) -> bool {
+    let Some((name, _)) = arg.split_once('=') else {
+        return false;
+    };
+
+    !name.is_empty() && !name.starts_with('-')
+}
+
+/// Returns the executable name that givetray will treat as the ephemeral
+/// command target.
+///
+/// This is used to block recursive `givetray -- givetray ...` launches while
+/// still recognizing the supported `sudo` prefixes: plain `sudo CMD`,
+/// `sudo -- CMD`, `sudo -u root CMD`, and `sudo NAME=value CMD`.
+fn effective_command_token(argv: &[String]) -> Option<&str> {
+    let first = argv.first()?;
+    let first_name = command_file_name(first)?;
+    if first_name != "sudo" {
+        return Some(first_name);
     }
-    if args.iter().any(|arg| arg == "-V" || arg == "--version") {
-        print_version();
-        process::exit(0);
+
+    let mut skip_next = false;
+    for arg in &argv[1..] {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+
+        if arg == "--" {
+            continue;
+        }
+
+        if is_environment_assignment(arg) {
+            continue;
+        }
+
+        if arg.starts_with("--") {
+            if let Some((flag, _)) = arg.split_once('=') {
+                if sudo_option_takes_value(flag) {
+                    continue;
+                }
+            }
+            if sudo_option_takes_value(arg) {
+                skip_next = true;
+                continue;
+            }
+        } else if arg.starts_with('-') {
+            if arg.len() == 2 && sudo_option_takes_value(arg) {
+                skip_next = true;
+                continue;
+            }
+            if arg.len() > 2 && sudo_option_takes_value(&arg[..2]) {
+                continue;
+            }
+            continue;
+        }
+
+        return command_file_name(arg);
+    }
+
+    None
+}
+
+fn parse_cli_args() -> Result<CliOptions, String> {
+    match parse_cli_request_from(env::args())? {
+        CliRequest::Run(cli) => Ok(cli),
+        CliRequest::PrintHelp => {
+            print_help();
+            process::exit(0);
+        }
+        CliRequest::PrintVersion => {
+            print_version();
+            process::exit(0);
+        }
+    }
+}
+
+fn parse_cli_request_from<I, S>(args: I) -> Result<CliRequest, String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let args: Vec<String> = args.into_iter().map(Into::into).collect();
+    let raw_args = args.get(1..).unwrap_or(&[]);
+    let option_args = match raw_args.iter().position(|arg| arg == "--") {
+        Some(separator_index) => &raw_args[..separator_index],
+        None => raw_args,
+    };
+
+    if option_args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        return Ok(CliRequest::PrintHelp);
+    }
+    if option_args
+        .iter()
+        .any(|arg| arg == "-V" || arg == "--version")
+    {
+        return Ok(CliRequest::PrintVersion);
+    }
+
+    Ok(CliRequest::Run(parse_cli_args_from(args)?))
+}
+
+fn parse_cli_args_from<I, S>(args: I) -> Result<CliOptions, String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut args: Vec<String> = args.into_iter().map(Into::into).collect();
+    if !args.is_empty() {
+        args.remove(0);
     }
 
     let mut mode = CliMode::Run;
@@ -363,6 +653,49 @@ fn parse_cli_args() -> Result<CliOptions, String> {
             autostart: false,
         };
         args.remove(0);
+    }
+
+    if let Some(separator_index) = args.iter().position(|arg| arg == "--") {
+        if matches!(mode, CliMode::DesktopFile { .. }) {
+            return Err("desktop-file does not support ephemeral mode".to_string());
+        }
+
+        let prefix = &args[..separator_index];
+        let argv = args[(separator_index + 1)..].to_vec();
+        if argv.is_empty() {
+            return Err("ephemeral mode command cannot be empty".to_string());
+        }
+        if let Some(flag) = prefix
+            .iter()
+            .find(|arg| arg.as_str() == "-c" || arg.as_str() == "--config")
+        {
+            return Err(format!(
+                "cannot mix persistent profile mode and ephemeral mode: {flag}"
+            ));
+        }
+        if let Some(flag) = prefix
+            .iter()
+            .find(|arg| matches!(arg.as_str(), "-cmd" | "--command" | "--icon" | "--log-file"))
+        {
+            return Err(format!("{flag} is not allowed in ephemeral mode"));
+        }
+        if let Some(flag) = prefix
+            .iter()
+            .find(|arg| matches!(arg.as_str(), "--output-dir" | "--autostart"))
+        {
+            return Err(format!("{flag} is only valid with desktop-file"));
+        }
+        if let Some(unknown) = prefix.first() {
+            return Err(format!("unknown argument: {unknown}"));
+        }
+
+        return Ok(CliOptions {
+            run_target: CliRunTarget::EphemeralArgv { argv },
+            command_override: None,
+            icon_source: None,
+            log_file: None,
+            mode,
+        });
     }
 
     let mut profile: Option<String> = None;
@@ -449,7 +782,7 @@ fn parse_cli_args() -> Result<CliOptions, String> {
         profile.ok_or_else(|| "missing required -c/--config PROFILE argument".to_string())?;
 
     Ok(CliOptions {
-        profile,
+        run_target: CliRunTarget::PersistentProfile { profile },
         command_override,
         icon_source,
         log_file,
@@ -457,11 +790,59 @@ fn parse_cli_args() -> Result<CliOptions, String> {
     })
 }
 
-fn print_help() {
-    println!(
-        "{name}\n\nUsage:\n  {name} -c PROFILE [-cmd COMMAND|--command COMMAND] [--icon ICON_PATH] [--log-file LOG_PATH]\n  {name} desktop-file -c PROFILE [-cmd COMMAND|--command COMMAND] [--output-dir DIR] [--autostart] [--icon ICON_PATH]\n\nOptions:\n  -c, --config PROFILE    Required profile name (letters, numbers, '-' or '_')\n  -cmd, --command COMMAND Set or overwrite saved command for the profile\n      --icon ICON_PATH    Copy icon into the selected profile and update config\n      --log-file LOG_PATH Enable log-to-file and set output path (app mode only)\n      --output-dir DIR    Output directory for desktop file (desktop-file mode only)\n      --autostart         Mark desktop file as autostart and default to ~/.config/autostart\n  -h, --help              Show this help\n  -V, --version           Show version\n",
+fn validate_runtime_mode(cli: &CliOptions) -> Result<(), String> {
+    if let CliRunTarget::EphemeralArgv { ref argv } = cli.run_target {
+        if effective_command_token(argv).is_some_and(|token| token == APP_NAME) {
+            return Err("recursive ephemeral mode cannot launch givetray again".to_string());
+        }
+    }
+
+    Ok(())
+}
+
+const HELP_USAGE_LINES: [&str; 3] = [
+    "  {name} -c PROFILE [-cmd COMMAND|--command COMMAND] [--icon ICON_PATH] [--log-file LOG_PATH]",
+    "  {name} -- <command...>",
+    "  {name} desktop-file -c PROFILE [-cmd COMMAND|--command COMMAND] [--output-dir DIR] [--autostart] [--icon ICON_PATH]",
+];
+
+const HELP_MODE_LINES: [&str; 3] = [
+    "  Persistent profile mode  Saved config, desktop entry support, and Configuration access",
+    "  Ephemeral mode           Temporary, profile-free command launch via -- <command...>",
+    "                           Starts immediately and keeps tray Start/Stop; Configuration is hidden",
+];
+
+const HELP_OPTION_LINES: [&str; 8] = [
+    "  -c, --config PROFILE    Required profile name (letters, numbers, '-' or '_')",
+    "  -cmd, --command COMMAND Set or overwrite saved command for the profile",
+    "      --icon ICON_PATH    Copy icon into the selected profile and update config",
+    "      --log-file LOG_PATH Enable log-to-file and set output path (app mode only)",
+    "      --output-dir DIR    Output directory for desktop file (desktop-file mode only)",
+    "      --autostart         Mark desktop file as autostart and default to ~/.config/autostart",
+    "  -h, --help              Show this help",
+    "  -V, --version           Show version",
+];
+
+fn render_help_lines(lines: &[&str]) -> String {
+    lines
+        .iter()
+        .map(|line| line.replace("{name}", APP_NAME))
+        .collect::<Vec<String>>()
+        .join("\n")
+}
+
+fn help_text() -> String {
+    format!(
+        "{name}\n\nUsage:\n{usage}\n\nModes:\n{modes}\n\nOptions:\n{options}\n",
         name = APP_NAME,
-    );
+        usage = render_help_lines(&HELP_USAGE_LINES),
+        modes = render_help_lines(&HELP_MODE_LINES),
+        options = render_help_lines(&HELP_OPTION_LINES),
+    )
+}
+
+fn print_help() {
+    println!("{}", help_text());
 }
 
 fn print_version() {
@@ -519,7 +900,10 @@ fn apply_cli_overrides_to_config(config: &mut Config, cli: &CliOptions) -> Resul
     }
 
     if let Some(source_path) = cli.icon_source.as_ref() {
-        let copied_path = copy_icon_to_profile(source_path, &cli.profile)?;
+        let profile = cli
+            .persistent_profile()
+            .ok_or_else(|| "persistent profile is required for config overrides".to_string())?;
+        let copied_path = copy_icon_to_profile(source_path, profile)?;
         let copied_path = copied_path.to_string_lossy().to_string();
         if config.icon_path.as_deref() != Some(copied_path.as_str()) {
             config.icon_path = Some(copied_path);
@@ -537,7 +921,10 @@ fn apply_cli_overrides_to_config(config: &mut Config, cli: &CliOptions) -> Resul
     }
 
     if config.log_to_file && config.log_file_path.is_none() {
-        if let Some(default_path) = default_log_file_path(&cli.profile) {
+        let profile = cli
+            .persistent_profile()
+            .ok_or_else(|| "persistent profile is required for config overrides".to_string())?;
+        if let Some(default_path) = default_log_file_path(profile) {
             config.log_file_path = Some(default_path.to_string_lossy().to_string());
             changed = true;
         }
@@ -551,7 +938,10 @@ fn create_desktop_file_from_cli(
     output_dir: Option<PathBuf>,
     autostart: bool,
 ) -> Result<(), String> {
-    let config_path = config_path_for_profile(&cli.profile)
+    let profile = cli
+        .persistent_profile()
+        .ok_or_else(|| "desktop-file requires a persistent profile".to_string())?;
+    let config_path = config_path_for_profile(profile)
         .ok_or_else(|| "unable to resolve configuration path".to_string())?;
     let mut config = load_or_create_config(&config_path);
 
@@ -566,16 +956,16 @@ fn create_desktop_file_from_cli(
         .map_err(|err| format!("unable to resolve icon path for desktop file: {err}"))?;
 
     let desktop_path = if let Some(dir) = output_dir {
-        dir.join(desktop_file_name(&cli.profile))
+        dir.join(desktop_file_name(profile))
     } else if autostart {
-        autostart_desktop_path(&cli.profile)
+        autostart_desktop_path(profile)
             .ok_or_else(|| "unable to resolve autostart desktop path".to_string())?
     } else {
-        applications_desktop_path(&cli.profile)
+        applications_desktop_path(profile)
             .ok_or_else(|| "unable to resolve Applications desktop path".to_string())?
     };
 
-    let contents = desktop_entry(&exec_path, &icon_path, &cli.profile, autostart);
+    let contents = desktop_entry(&exec_path, &icon_path, profile, autostart);
     write_desktop_file(&desktop_path, &contents)
         .map_err(|err| format!("failed to write desktop file: {err}"))?;
 
@@ -1245,6 +1635,17 @@ fn setup_menu_polling(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>) {
                 window.show_all();
                 window.resize(820, 520);
             } else if id == "configure" {
+                let can_configure = {
+                    let state = state.borrow();
+                    should_expose_configuration(state.persistent_config_access.as_ref())
+                };
+                if !can_configure {
+                    append_log(
+                        &mut state.borrow_mut(),
+                        "configuration window is unavailable in ephemeral mode".to_string(),
+                    );
+                    continue;
+                }
                 let (
                     window,
                     view,
@@ -1364,11 +1765,18 @@ fn save_configuration(
     log_to_file_enabled: bool,
 ) -> bool {
     let mut state = state.borrow_mut();
+    let Some(access) = state.persistent_config_access.clone() else {
+        append_log(
+            &mut state,
+            "configuration save is unavailable in ephemeral mode".to_string(),
+        );
+        return false;
+    };
     let new_autostart = state.config_autostart.is_active();
     let mut new_log_file_path = state.saved_log_file_path.clone();
     if log_to_file_enabled && new_log_file_path.is_none() {
         new_log_file_path =
-            default_log_file_path(&state.profile).map(|path| path.to_string_lossy().to_string());
+            default_log_file_path(&access.profile).map(|path| path.to_string_lossy().to_string());
     }
     let new_config = Config {
         command: text.clone(),
@@ -1378,7 +1786,7 @@ fn save_configuration(
         log_file_path: new_log_file_path.clone(),
     };
 
-    if let Err(err) = save_config(&state.config_path, &new_config) {
+    if let Err(err) = save_config(&access.config_path, &new_config) {
         append_log(&mut state, format!("Failed to save configuration: {err}"));
         return false;
     }
@@ -1415,9 +1823,16 @@ fn refresh_desktop_toggles(
     apps_toggle: &gtk::CheckButton,
     system_autostart_toggle: &gtk::CheckButton,
 ) {
-    let profile = state.borrow().profile.clone();
-    let apps_exists = applications_desktop_path(&profile).is_some_and(|path| path.exists());
-    let autostart_exists = autostart_desktop_path(&profile).is_some_and(|path| path.exists());
+    let access = state.borrow().persistent_config_access.clone();
+    let enabled = access.is_some();
+    let (apps_exists, autostart_exists) = if let Some(access) = access {
+        (
+            applications_desktop_path(&access.profile).is_some_and(|path| path.exists()),
+            autostart_desktop_path(&access.profile).is_some_and(|path| path.exists()),
+        )
+    } else {
+        (false, false)
+    };
 
     {
         let mut app = state.borrow_mut();
@@ -1428,6 +1843,8 @@ fn refresh_desktop_toggles(
 
     apps_toggle.set_active(apps_exists);
     system_autostart_toggle.set_active(autostart_exists);
+    apps_toggle.set_sensitive(enabled);
+    system_autostart_toggle.set_sensitive(enabled);
 
     {
         let mut app = state.borrow_mut();
@@ -1442,6 +1859,18 @@ fn apply_desktop_actions(
     apps_enabled: bool,
     autostart_enabled: bool,
 ) {
+    let access = {
+        let app = state.borrow();
+        app.persistent_config_access.clone()
+    };
+    let Some(access) = access else {
+        append_log(
+            &mut state.borrow_mut(),
+            "desktop entry actions are unavailable in ephemeral mode".to_string(),
+        );
+        return;
+    };
+
     let exec_path = match env::current_exe() {
         Ok(path) => path,
         Err(err) => {
@@ -1453,9 +1882,9 @@ fn apply_desktop_actions(
         }
     };
 
-    let (profile, icon_path, config_path) = {
+    let icon_path = {
         let app = state.borrow();
-        let config = load_or_create_config(&app.config_path);
+        let config = load_or_create_config(&access.config_path);
         let icon_path = match resolve_icon_path_for_desktop(&config) {
             Ok(path) => path,
             Err(err) => {
@@ -1467,14 +1896,14 @@ fn apply_desktop_actions(
                 return;
             }
         };
-        (app.profile.clone(), icon_path, app.config_path.clone())
+        icon_path
     };
 
-    let desktop_name = desktop_file_name(&profile);
+    let desktop_name = desktop_file_name(&access.profile);
 
-    if let Some(path) = applications_desktop_path(&profile) {
+    if let Some(path) = applications_desktop_path(&access.profile) {
         if apps_enabled {
-            let content = desktop_entry(&exec_path, &icon_path, &profile, false);
+            let content = desktop_entry(&exec_path, &icon_path, &access.profile, false);
             if let Err(err) = write_desktop_file(&path, &content) {
                 append_log(
                     &mut state.borrow_mut(),
@@ -1505,9 +1934,9 @@ fn apply_desktop_actions(
         );
     }
 
-    if let Some(path) = autostart_desktop_path(&profile) {
+    if let Some(path) = autostart_desktop_path(&access.profile) {
         if autostart_enabled {
-            let content = desktop_entry(&exec_path, &icon_path, &profile, true);
+            let content = desktop_entry(&exec_path, &icon_path, &access.profile, true);
             if let Err(err) = write_desktop_file(&path, &content) {
                 append_log(
                     &mut state.borrow_mut(),
@@ -1538,8 +1967,8 @@ fn apply_desktop_actions(
         );
     }
 
-    let config = load_or_create_config(&config_path);
-    if let Err(err) = save_config(&config_path, &config) {
+    let config = load_or_create_config(&access.config_path);
+    if let Err(err) = save_config(&access.config_path, &config) {
         append_log(
             &mut state.borrow_mut(),
             format!("Failed to sync configuration file: {err}"),
@@ -1992,12 +2421,9 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(reader: R, ui_tx: Sender<UiEv
 }
 
 fn is_sudo_command(args: &[String]) -> bool {
-    args.first().is_some_and(|arg| {
-        Path::new(arg)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name == "sudo")
-    })
+    args.first()
+        .and_then(|arg| command_file_name(arg))
+        .is_some_and(|name| name == "sudo")
 }
 
 fn ensure_sudo_stdin_flag(args: &mut Vec<String>) {
@@ -2059,4 +2485,501 @@ fn prompt_sudo_password() -> Option<Zeroizing<String>> {
 
     dialog.close();
     password
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct TestEnvGuard {
+        home: Option<String>,
+        xdg_config_home: Option<String>,
+        xdg_data_home: Option<String>,
+    }
+
+    impl TestEnvGuard {
+        fn set(temp_root: &Path) -> Self {
+            let guard = Self {
+                home: env::var("HOME").ok(),
+                xdg_config_home: env::var("XDG_CONFIG_HOME").ok(),
+                xdg_data_home: env::var("XDG_DATA_HOME").ok(),
+            };
+
+            let home = temp_root.join("home");
+            let config = temp_root.join("config");
+            let data = temp_root.join("data");
+            fs::create_dir_all(&home).expect("test home dir should be created");
+            fs::create_dir_all(&config).expect("test config dir should be created");
+            fs::create_dir_all(&data).expect("test data dir should be created");
+
+            env::set_var("HOME", &home);
+            env::set_var("XDG_CONFIG_HOME", &config);
+            env::set_var("XDG_DATA_HOME", &data);
+
+            guard
+        }
+    }
+
+    impl Drop for TestEnvGuard {
+        fn drop(&mut self) {
+            match self.home.as_ref() {
+                Some(value) => env::set_var("HOME", value),
+                None => env::remove_var("HOME"),
+            }
+            match self.xdg_config_home.as_ref() {
+                Some(value) => env::set_var("XDG_CONFIG_HOME", value),
+                None => env::remove_var("XDG_CONFIG_HOME"),
+            }
+            match self.xdg_data_home.as_ref() {
+                Some(value) => env::set_var("XDG_DATA_HOME", value),
+                None => env::remove_var("XDG_DATA_HOME"),
+            }
+        }
+    }
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        env::temp_dir().join(format!("givetray-{name}-{}-{nonce}", process::id()))
+    }
+
+    #[test]
+    fn help_text_documents_ephemeral_mode() {
+        let help = help_text();
+
+        assert!(help.contains("Usage:\n  givetray -c PROFILE [-cmd COMMAND|--command COMMAND] [--icon ICON_PATH] [--log-file LOG_PATH]\n  givetray -- <command...>\n  givetray desktop-file -c PROFILE [-cmd COMMAND|--command COMMAND] [--output-dir DIR] [--autostart] [--icon ICON_PATH]"));
+        assert!(help.contains("Modes:\n  Persistent profile mode  Saved config, desktop entry support, and Configuration access\n  Ephemeral mode           Temporary, profile-free command launch via -- <command...>\n                           Starts immediately and keeps tray Start/Stop; Configuration is hidden"));
+    }
+
+    #[test]
+    fn parse_persistent_profile_mode() {
+        let cli = parse_cli_args_from(["givetray", "-c", "default"])
+            .expect("persistent profile mode should parse");
+
+        assert!(matches!(
+            cli.run_target,
+            CliRunTarget::PersistentProfile { ref profile } if profile == "default"
+        ));
+        assert!(matches!(cli.mode, CliMode::Run));
+    }
+
+    #[test]
+    fn parse_ephemeral_mode() {
+        let cli = parse_cli_args_from(["givetray", "--", "echo", "hello world"])
+            .expect("ephemeral mode should parse");
+
+        assert!(matches!(
+            cli.run_target,
+            CliRunTarget::EphemeralArgv { ref argv }
+                if argv == &["echo".to_string(), "hello world".to_string()]
+        ));
+        assert!(matches!(cli.mode, CliMode::Run));
+    }
+
+    #[test]
+    fn parse_ephemeral_mode_passes_through_help_flag() {
+        let request = parse_cli_request_from(["givetray", "--", "echo", "--help"])
+            .expect("ephemeral help arg should parse");
+
+        let cli = match request {
+            CliRequest::Run(cli) => cli,
+            CliRequest::PrintHelp => panic!("help flag after -- must not be intercepted"),
+            CliRequest::PrintVersion => panic!("version flag after -- must not be intercepted"),
+        };
+
+        assert!(matches!(
+            cli.run_target,
+            CliRunTarget::EphemeralArgv { ref argv }
+                if argv == &["echo".to_string(), "--help".to_string()]
+        ));
+    }
+
+    #[test]
+    fn parse_ephemeral_mode_passes_through_version_flag() {
+        let request = parse_cli_request_from(["givetray", "--", "echo", "--version"])
+            .expect("ephemeral version arg should parse");
+
+        let cli = match request {
+            CliRequest::Run(cli) => cli,
+            CliRequest::PrintHelp => panic!("help flag after -- must not be intercepted"),
+            CliRequest::PrintVersion => panic!("version flag after -- must not be intercepted"),
+        };
+
+        assert!(matches!(
+            cli.run_target,
+            CliRunTarget::EphemeralArgv { ref argv }
+                if argv == &["echo".to_string(), "--version".to_string()]
+        ));
+    }
+
+    #[test]
+    fn reject_empty_ephemeral_mode() {
+        let err =
+            parse_cli_args_from(["givetray", "--"]).expect_err("empty ephemeral mode must fail");
+
+        assert!(err.contains("ephemeral"));
+        assert!(err.contains("empty"));
+    }
+
+    #[test]
+    fn reject_mixed_profile_and_ephemeral_mode() {
+        let err = parse_cli_args_from(["givetray", "-c", "default", "--", "echo", "hi"])
+            .expect_err("mixed mode must fail");
+
+        assert!(err.contains("cannot mix"));
+    }
+
+    #[test]
+    fn reject_profile_only_flags_in_ephemeral_mode() {
+        let err = parse_cli_args_from([
+            "givetray",
+            "--log-file",
+            "/tmp/givetray.log",
+            "--",
+            "echo",
+            "hi",
+        ])
+        .expect_err("profile-only flags must fail in ephemeral mode");
+
+        assert!(err.contains("ephemeral mode"));
+        assert!(err.contains("--log-file"));
+    }
+
+    #[test]
+    fn parse_desktop_file_profile_mode() {
+        let cli = parse_cli_args_from(["givetray", "desktop-file", "-c", "scrcpy"])
+            .expect("desktop-file profile mode should parse");
+
+        assert!(matches!(
+            cli.run_target,
+            CliRunTarget::PersistentProfile { ref profile } if profile == "scrcpy"
+        ));
+        assert!(matches!(
+            cli.mode,
+            CliMode::DesktopFile {
+                output_dir: None,
+                autostart: false
+            }
+        ));
+    }
+
+    #[test]
+    fn reject_desktop_file_ephemeral_mode() {
+        let err = parse_cli_args_from(["givetray", "desktop-file", "--", "echo", "hi"])
+            .expect_err("desktop-file must reject ephemeral mode");
+
+        assert!(err.contains("desktop-file"));
+        assert!(err.contains("ephemeral mode"));
+    }
+
+    #[test]
+    fn allow_ephemeral_runtime_when_non_recursive() {
+        let cli = parse_cli_args_from(["givetray", "--", "echo", "hello"])
+            .expect("ephemeral mode should parse");
+
+        validate_runtime_mode(&cli).expect("ephemeral runtime should now be allowed");
+    }
+
+    #[test]
+    fn reject_recursive_ephemeral_givetray_command() {
+        let cli = parse_cli_args_from(["givetray", "--", "givetray", "-c", "default"])
+            .expect("recursive ephemeral mode should still parse");
+
+        let err = validate_runtime_mode(&cli)
+            .expect_err("recursive ephemeral givetray command must be rejected");
+
+        assert!(err.contains("recursive"));
+        assert!(err.contains("givetray"));
+    }
+
+    #[test]
+    fn reject_recursive_ephemeral_sudo_givetray_command() {
+        let cli = parse_cli_args_from(["givetray", "--", "sudo", "givetray", "-c", "default"])
+            .expect("sudo recursive ephemeral mode should still parse");
+
+        let err = validate_runtime_mode(&cli)
+            .expect_err("sudo recursive ephemeral givetray command must be rejected");
+
+        assert!(err.contains("recursive"));
+        assert!(err.contains("givetray"));
+    }
+
+    #[test]
+    fn build_detached_args_for_ephemeral_mode() {
+        let args = build_detached_args(&CliOptions {
+            run_target: CliRunTarget::EphemeralArgv {
+                argv: vec![
+                    "echo".to_string(),
+                    "hello world".to_string(),
+                    "--flag=value".to_string(),
+                ],
+            },
+            command_override: None,
+            icon_source: None,
+            log_file: None,
+            mode: CliMode::Run,
+        });
+
+        assert_eq!(
+            args,
+            vec![
+                "--".to_string(),
+                "echo".to_string(),
+                "hello world".to_string(),
+                "--flag=value".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_detached_args_for_persistent_mode() {
+        let args = build_detached_args(&CliOptions {
+            run_target: CliRunTarget::PersistentProfile {
+                profile: "default".to_string(),
+            },
+            command_override: None,
+            icon_source: None,
+            log_file: None,
+            mode: CliMode::Run,
+        });
+
+        assert_eq!(args, vec!["--config".to_string(), "default".to_string()]);
+    }
+
+    #[test]
+    fn build_detached_args_for_persistent_mode_preserves_overrides() {
+        let args = build_detached_args(&CliOptions {
+            run_target: CliRunTarget::PersistentProfile {
+                profile: "default".to_string(),
+            },
+            command_override: Some("echo detached run".to_string()),
+            icon_source: Some(PathBuf::from("/tmp/icon.png")),
+            log_file: Some(PathBuf::from("/tmp/givetray.log")),
+            mode: CliMode::Run,
+        });
+
+        assert_eq!(
+            args,
+            vec![
+                "--config".to_string(),
+                "default".to_string(),
+                "--command".to_string(),
+                "echo detached run".to_string(),
+                "--icon".to_string(),
+                "/tmp/icon.png".to_string(),
+                "--log-file".to_string(),
+                "/tmp/givetray.log".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn effective_command_token_supports_sudo_then_givetray() {
+        let argv = vec!["/usr/bin/sudo".to_string(), "givetray".to_string()];
+
+        assert_eq!(effective_command_token(&argv), Some("givetray"));
+    }
+
+    #[test]
+    fn effective_command_token_supports_direct_givetray_path() {
+        let argv = vec!["/path/to/givetray".to_string()];
+
+        assert_eq!(effective_command_token(&argv), Some("givetray"));
+    }
+
+    #[test]
+    fn effective_command_token_supports_sudo_double_dash() {
+        let argv = vec!["sudo".to_string(), "--".to_string(), "givetray".to_string()];
+
+        assert_eq!(effective_command_token(&argv), Some("givetray"));
+    }
+
+    #[test]
+    fn effective_command_token_supports_sudo_user_option() {
+        let argv = vec![
+            "sudo".to_string(),
+            "-u".to_string(),
+            "root".to_string(),
+            "givetray".to_string(),
+        ];
+
+        assert_eq!(effective_command_token(&argv), Some("givetray"));
+    }
+
+    #[test]
+    fn effective_command_token_supports_sudo_environment_assignment() {
+        let argv = vec![
+            "sudo".to_string(),
+            "FOO=bar".to_string(),
+            "givetray".to_string(),
+        ];
+
+        assert_eq!(effective_command_token(&argv), Some("givetray"));
+    }
+
+    #[test]
+    fn ephemeral_tooltip_uses_mode_label() {
+        let tooltip = tray_tooltip(&CliRunTarget::EphemeralArgv {
+            argv: vec!["echo".to_string(), "hello".to_string()],
+        });
+
+        assert_eq!(tooltip, "givetray (ephemeral)");
+    }
+
+    #[test]
+    fn ephemeral_command_text_preserves_args() {
+        let command = ephemeral_command_text(&[
+            "printf".to_string(),
+            "hello world".to_string(),
+            "--flag=value".to_string(),
+            "quote\"me".to_string(),
+        ]);
+
+        assert_eq!(command, "printf 'hello world' --flag=value 'quote\"me'");
+    }
+
+    #[test]
+    fn ephemeral_command_text_round_trips_backslashes() {
+        let argv = vec![
+            "printf".to_string(),
+            "C:\\temp\\file.txt".to_string(),
+            "path with \\ slash".to_string(),
+        ];
+
+        let command = ephemeral_command_text(&argv);
+        let reparsed = shell_words::split(&command).expect("generated command should parse");
+
+        assert_eq!(reparsed, argv);
+    }
+
+    #[test]
+    fn ephemeral_runtime_config_defaults_are_non_persistent() {
+        let config = ephemeral_runtime_config(&["echo".to_string(), "hello world".to_string()]);
+
+        assert_eq!(config.command, "echo 'hello world'");
+        assert!(!config.autostart);
+        assert_eq!(config.icon_path, None);
+        assert!(!config.log_to_file);
+        assert_eq!(config.log_file_path, None);
+    }
+
+    #[test]
+    fn ephemeral_mode_hides_configuration_menu() {
+        let startup = StartupState {
+            profile_label: "ephemeral".to_string(),
+            persistent_config_access: None,
+            config: ephemeral_runtime_config(&["echo".to_string()]),
+            log_file_path: None,
+            launch_on_startup: true,
+        };
+
+        assert!(!should_expose_configuration(
+            startup.persistent_config_access.as_ref()
+        ));
+    }
+
+    #[test]
+    fn persistent_mode_exposes_configuration_menu() {
+        let startup = StartupState {
+            profile_label: "default".to_string(),
+            persistent_config_access: Some(PersistentConfigAccess {
+                profile: "default".to_string(),
+                config_path: PathBuf::from("/tmp/default.toml"),
+            }),
+            config: Config {
+                command: DEFAULT_COMMAND.to_string(),
+                autostart: false,
+                icon_path: None,
+                log_to_file: false,
+                log_file_path: None,
+            },
+            log_file_path: None,
+            launch_on_startup: false,
+        };
+
+        assert!(should_expose_configuration(
+            startup.persistent_config_access.as_ref()
+        ));
+    }
+
+    #[test]
+    fn persistent_configuration_access_source_of_truth_requires_profile_and_config_path() {
+        assert!(persistent_config_access(
+            Some("default".to_string()),
+            Some(PathBuf::from("/tmp/default.toml")),
+        )
+        .is_some());
+        assert!(persistent_config_access(Some("default".to_string()), None).is_none());
+        assert!(persistent_config_access(None, Some(PathBuf::from("/tmp/default.toml"))).is_none());
+        assert!(persistent_config_access(None, None).is_none());
+    }
+
+    #[test]
+    fn ephemeral_startup_state_has_no_persistent_configuration_access() {
+        let cli = parse_cli_args_from(["givetray", "--", "echo", "hello"])
+            .expect("ephemeral mode should parse");
+        let startup = build_startup_state(&cli).expect("ephemeral startup should build");
+
+        assert!(startup.persistent_config_access.is_none());
+        assert!(!should_expose_configuration(
+            startup.persistent_config_access.as_ref()
+        ));
+    }
+
+    #[test]
+    fn persistent_startup_state_exposes_configuration_from_source_of_truth() {
+        let startup = StartupState {
+            profile_label: "default".to_string(),
+            persistent_config_access: Some(PersistentConfigAccess {
+                profile: "default".to_string(),
+                config_path: PathBuf::from("/tmp/default.toml"),
+            }),
+            config: Config {
+                command: DEFAULT_COMMAND.to_string(),
+                autostart: false,
+                icon_path: None,
+                log_to_file: false,
+                log_file_path: None,
+            },
+            log_file_path: None,
+            launch_on_startup: false,
+        };
+
+        assert!(should_expose_configuration(
+            startup.persistent_config_access.as_ref()
+        ));
+    }
+
+    #[test]
+    fn startup_preflight_runs_before_detach_for_persistent_profiles() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock should be acquired");
+        let temp_root = unique_test_dir("startup-preflight-order");
+        fs::create_dir_all(&temp_root).expect("temp root should be created");
+        let _env = TestEnvGuard::set(&temp_root);
+
+        let cli = parse_cli_args_from(["givetray", "-c", "preflight", "--command", "printf ready"])
+            .expect("persistent cli should parse");
+
+        let startup = prepare_run_startup_with(&cli, |cli| {
+            let profile = cli
+                .persistent_profile()
+                .expect("profile should still be persistent");
+            let config_path = config_path_for_profile(profile).expect("config path should resolve");
+            let saved = fs::read_to_string(&config_path)
+                .expect("config should already be written before detach");
+
+            assert!(saved.contains("printf ready"));
+
+            Ok(())
+        })
+        .expect("startup preparation should succeed");
+
+        assert_eq!(startup.config.command, "printf ready");
+        assert!(startup.persistent_config_access.is_some());
+    }
 }

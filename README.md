@@ -1,7 +1,7 @@
 # givetray
 
-`givetray` runs terminal commands from the Linux system tray using named profiles.
-Each profile can run one command, show live logs, and manage desktop entries.
+`givetray` runs terminal commands from the Linux system tray using either named profiles or a temporary profile-free command.
+Persistent profiles can run one saved command, show live logs, and manage desktop entries.
 
 ![givetray icon](assets/icon.png)
 
@@ -48,6 +48,8 @@ On first run, `givetray` creates `~/.config/givetray/configs/<profile>.toml`.
 Then open `Configuration` from the tray menu and set your command/script.
 When launched from a terminal, `givetray` detaches to the background and returns control to the shell.
 
+Ephemeral mode launches immediately with `givetray -- <command...>`, does not use a profile, does not write config, keeps tray `Start/Stop` available for the temporary command, and hides `Configuration` in the tray menu.
+
 ## CLI Usage
 
 `-c/--config PROFILE` is required for app mode and desktop-file mode.
@@ -55,6 +57,7 @@ Profile names support letters, numbers, `-`, and `_`.
 
 ```bash
 givetray -c PROFILE [-cmd COMMAND|--command COMMAND] [--icon ICON_PATH] [--log-file LOG_PATH]
+givetray -- <command...>
 givetray desktop-file -c PROFILE [-cmd COMMAND|--command COMMAND] [--output-dir DIR] [--autostart] [--icon ICON_PATH]
 givetray --help
 givetray --version
@@ -63,15 +66,23 @@ givetray --version
 Examples:
 
 ```bash
+# Persistent profile mode
 givetray -c scrcpy
 givetray -c scrcpy -cmd "scrcpy --always-on-top -S -w"
 givetray -c scrcpy --icon /path/to/icon.png
 givetray -c scrcpy --log-file ~/.local/share/givetray/logs/scrcpy.log
+
+# Ephemeral mode
+givetray -- notify-send "Backup complete"
+givetray -- sh -lc "while true; do date; sleep 60; done"
+
+# Desktop file generation remains profile-based
 givetray desktop-file -c scrcpy
 givetray desktop-file -c scrcpy --autostart
 ```
 
 When `-cmd/--command` is provided, the profile's saved command is overwritten.
+Ephemeral mode is temporary and profile-free, so desktop files and saved configuration do not apply even though the tray can still `Start/Stop` the active command.
 
 ## Desktop Entries
 
@@ -88,7 +99,7 @@ When `-cmd/--command` is provided, the profile's saved command is overwritten.
 
 - `Start/Stop`: run or stop the configured command
 - `Logs`: open live log window
-- `Configuration`: edit profile command and toggles
+- `Configuration`: edit profile command and toggles in persistent profile mode only
 - `About`: show app info and links
 - `Exit`: stop current process and quit this instance
 
