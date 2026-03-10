@@ -184,11 +184,15 @@ pub(crate) fn save_configuration(
     state.saved_autostart = new_autostart;
     state.saved_log_to_file = log_to_file_enabled;
     state.saved_log_file_path = new_log_file_path;
-    state.log_file_path = if log_to_file_enabled {
+    let next_log_file_path = if log_to_file_enabled {
         state.saved_log_file_path.as_ref().map(PathBuf::from)
     } else {
         None
     };
+    if state.log_file_path != next_log_file_path {
+        state.log_file_writer = None;
+    }
+    state.log_file_path = next_log_file_path;
 
     let saved_log_file_path = state.saved_log_file_path.clone();
     let saved_log_to_file = state.saved_log_to_file;

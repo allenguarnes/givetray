@@ -5,10 +5,13 @@ use crate::cli::{
     validate_runtime_mode,
 };
 use crate::config::config_path_for_profile;
-use crate::logs::{extract_log_links, should_activate_log_link, strip_ansi_codes};
+use crate::logs::{
+    append_log_to_file, extract_log_links, should_activate_log_link, strip_ansi_codes,
+};
 use crate::*;
 use std::env;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Mutex;
@@ -604,4 +607,29 @@ fn should_activate_log_link_requires_click_without_selection() {
         22.0,
         false,
     ));
+}
+
+#[test]
+fn append_log_to_file_reuses_writer_across_calls() {
+    let temp_root = unique_test_dir("log-writer-reuse");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let log_path = temp_root.join("logs").join("givetray.log");
+    let mut writer = None;
+
+    append_log_to_file(&mut writer, &log_path, "first line")
+        .expect("first log write should succeed");
+    assert!(writer.is_some());
+
+    append_log_to_file(&mut writer, &log_path, "second line")
+        .expect("second log write should succeed");
+
+    drop(writer);
+
+    let mut contents = String::new();
+    fs::File::open(&log_path)
+        .expect("log file should exist")
+        .read_to_string(&mut contents)
+        .expect("log file should be readable");
+
+    assert_eq!(contents, "first line\nsecond line\n");
 }

@@ -6,8 +6,8 @@ use async_channel::Receiver;
 use glib::{MainContext, Propagation};
 use gtk::gdk;
 use gtk::prelude::*;
-use std::fs;
-use std::io::Write;
+use std::fs::{self, File};
+use std::io::{LineWriter, Write};
 use std::path::Path;
 use std::{cell::RefCell, rc::Rc};
 
@@ -478,16 +478,32 @@ fn set_logs_link_cursor(text_view: &gtk::TextView, active: bool) {
     window.set_cursor(cursor.as_ref());
 }
 
-fn append_log_to_file(path: &Path, line: &str) -> Result<(), std::io::Error> {
+fn open_log_file_writer(path: &Path) -> Result<LineWriter<File>, std::io::Error> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    let mut file = fs::OpenOptions::new()
+    let file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)?;
-    writeln!(file, "{line}")
+    Ok(LineWriter::new(file))
+}
+
+pub(crate) fn append_log_to_file(
+    writer: &mut Option<LineWriter<File>>,
+    path: &Path,
+    line: &str,
+) -> Result<(), std::io::Error> {
+    if writer.is_none() {
+        *writer = Some(open_log_file_writer(path)?);
+    }
+
+    if let Some(writer) = writer.as_mut() {
+        writeln!(writer, "{line}")?;
+    }
+
+    Ok(())
 }
 
 pub(crate) fn strip_ansi_codes(line: &str) -> String {
@@ -570,10 +586,18 @@ pub(crate) fn append_log(state: &mut AppState, line: String) {
         state.log_links.pop_front();
         drop_oldest_log_line_from_buffer(&state.logs_buffer);
     }
-    state.log_lines.push_back(clean_line.clone());
-    state.log_links.push_back(links.clone());
 
     append_log_line_to_buffer(&state.logs_buffer, &clean_line, &links);
+
+    if let Some(path) = state.log_file_path.as_deref() {
+        if let Err(err) = append_log_to_file(&mut state.log_file_writer, path, &clean_line) {
+            eprintln!("failed to write log file at {}: {err}", path.display());
+            state.log_file_writer = None;
+        }
+    }
+
+    state.log_lines.push_back(clean_line);
+    state.log_links.push_back(links);
 
     let mut end_iter = state.logs_buffer.end_iter();
     state
@@ -581,10 +605,4 @@ pub(crate) fn append_log(state: &mut AppState, line: String) {
         .scroll_to_iter(&mut end_iter, 0.0, false, 0.0, 0.0);
 
     set_logs_status(&state.logs_status_label, state.log_lines.len(), None);
-
-    if let Some(path) = state.log_file_path.as_ref() {
-        if let Err(err) = append_log_to_file(path, &clean_line) {
-            eprintln!("failed to write log file at {}: {err}", path.display());
-        }
-    }
 }
