@@ -37,6 +37,7 @@ pub(crate) fn build_config_window(
     let buffer = gtk::TextBuffer::new(None::<&gtk::TextTagTable>);
     buffer.set_text(command);
     let text_view = gtk::TextView::with_buffer(&buffer);
+    text_view.set_widget_name("config-editor");
     text_view.set_monospace(true);
     text_view.set_wrap_mode(gtk::WrapMode::WordChar);
     text_view.set_hexpand(true);
@@ -642,10 +643,12 @@ pub(crate) fn install_log_filters() {
 pub(crate) fn install_css() {
     let provider = gtk::CssProvider::new();
     let css = b"
-        textview,
-        textview text {
+        textview#logs-view,
+        textview#logs-view text,
+        textview#config-editor,
+        textview#config-editor text {
             font-family: monospace;
-            font-size: 11pt;
+            font-size: 10pt;
         }
     ";
     provider.load_from_data(css).expect("failed to load CSS");

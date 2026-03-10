@@ -31,6 +31,7 @@ pub(crate) fn build_logs_window() -> (
 
     let buffer = gtk::TextBuffer::new(Some(&tag_table));
     let text_view = gtk::TextView::with_buffer(&buffer);
+    text_view.set_widget_name("logs-view");
     text_view.set_editable(false);
     text_view.set_monospace(true);
     text_view.set_cursor_visible(false);
