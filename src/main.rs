@@ -31,6 +31,8 @@ const MAX_PROFILE_LENGTH: usize = 128;
 const ICON_FILE_NAME: &str = "icon.png";
 const BUNDLED_ICON_FILE_NAME: &str = "default-icon.png";
 const BG_CHILD_ENV: &str = "GIVETRAY_BG_CHILD";
+const LOG_LINK_TAG_NAME: &str = "log-link";
+const LOG_LINK_CLICK_SLOP: f64 = 4.0;
 
 #[derive(Debug, Clone)]
 struct CliOptions {
@@ -101,6 +103,7 @@ struct AppState {
     saved_log_file_path: Option<String>,
     child: Option<Child>,
     log_lines: VecDeque<String>,
+    log_links: VecDeque<Vec<LogLink>>,
     log_file_path: Option<PathBuf>,
     logs_window: gtk::Window,
     logs_view: gtk::TextView,
@@ -125,6 +128,20 @@ struct AppState {
     config_last: String,
     config_ignore: bool,
     start_stop_item: MenuItem,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LogLink {
+    start_char: i32,
+    end_char: i32,
+    uri: String,
+}
+
+#[derive(Debug, Clone)]
+struct PendingLogLink {
+    uri: String,
+    x: f64,
+    y: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,6 +286,7 @@ fn main() {
         saved_log_file_path: startup.config.log_file_path.clone(),
         child: None,
         log_lines: VecDeque::new(),
+        log_links: VecDeque::new(),
         log_file_path: startup.log_file_path,
         logs_window,
         logs_view,
@@ -985,11 +1003,23 @@ fn build_logs_window() -> (
     window.set_title("Logs");
     window.set_default_size(820, 520);
 
-    let buffer = gtk::TextBuffer::new(None::<&gtk::TextTagTable>);
+    let tag_table = gtk::TextTagTable::new();
+    let link_tag = gtk::TextTag::new(Some(LOG_LINK_TAG_NAME));
+    link_tag.set_foreground(Some("#1c71d8"));
+    link_tag.set_underline(gtk::pango::Underline::Single);
+    tag_table.add(&link_tag);
+
+    let buffer = gtk::TextBuffer::new(Some(&tag_table));
     let text_view = gtk::TextView::with_buffer(&buffer);
     text_view.set_editable(false);
     text_view.set_monospace(true);
     text_view.set_cursor_visible(false);
+    text_view.add_events(
+        gdk::EventMask::BUTTON_PRESS_MASK
+            | gdk::EventMask::BUTTON_RELEASE_MASK
+            | gdk::EventMask::POINTER_MOTION_MASK
+            | gdk::EventMask::LEAVE_NOTIFY_MASK,
+    );
 
     text_view.set_left_margin(8);
     text_view.set_right_margin(8);
@@ -1562,7 +1592,9 @@ fn setup_logs_handlers(state: Rc<RefCell<AppState>>) {
     let clear_button = state.borrow().logs_clear_button.clone();
     let copy_button = state.borrow().logs_copy_button.clone();
     let buffer = state.borrow().logs_buffer.clone();
+    let text_view = state.borrow().logs_view.clone();
     let status_label = state.borrow().logs_status_label.clone();
+    let pending_link = Rc::new(RefCell::new(None::<PendingLogLink>));
 
     let state_clear = state.clone();
     let buffer_clear = buffer.clone();
@@ -1570,6 +1602,7 @@ fn setup_logs_handlers(state: Rc<RefCell<AppState>>) {
     clear_button.connect_clicked(move |_| {
         let mut state = state_clear.borrow_mut();
         state.log_lines.clear();
+        state.log_links.clear();
         buffer_clear.set_text("");
         set_logs_status(&status_clear, 0, Some("cleared"));
     });
@@ -1583,6 +1616,105 @@ fn setup_logs_handlers(state: Rc<RefCell<AppState>>) {
         clipboard.set_text(&text);
         let line_count = state_copy.borrow().log_lines.len();
         set_logs_status(&status_copy, line_count, Some("copied"));
+    });
+
+    let pending_press = pending_link.clone();
+    let state_press = state.clone();
+    text_view.connect_button_press_event(move |text_view, event| {
+        if event.button() != 1 {
+            pending_press.borrow_mut().take();
+            return Propagation::Proceed;
+        }
+
+        let candidate = event.window().and_then(|event_window| {
+            let (x, y) = event.position();
+            iter_at_pointer(text_view, &event_window, x, y).and_then(|iter| {
+                let state = state_press.borrow();
+                log_link_at_iter(&state, &iter).map(|uri| PendingLogLink { uri, x, y })
+            })
+        });
+
+        *pending_press.borrow_mut() = candidate;
+        Propagation::Proceed
+    });
+
+    let state_click = state.clone();
+    let status_click = status_label.clone();
+    let pending_release = pending_link.clone();
+    text_view.connect_button_release_event(move |text_view, event| {
+        if event.button() != 1 {
+            pending_release.borrow_mut().take();
+            return Propagation::Proceed;
+        }
+
+        let Some(event_window) = event.window() else {
+            pending_release.borrow_mut().take();
+            return Propagation::Proceed;
+        };
+        let (x, y) = event.position();
+        let Some(iter) = iter_at_pointer(text_view, &event_window, x, y) else {
+            pending_release.borrow_mut().take();
+            return Propagation::Proceed;
+        };
+
+        let (uri, has_selection) = {
+            let state = state_click.borrow();
+            (
+                log_link_at_iter(&state, &iter),
+                state.logs_buffer.has_selection(),
+            )
+        };
+        let activate = {
+            let pending = pending_release.borrow();
+            should_activate_log_link(pending.as_ref(), uri.as_deref(), x, y, has_selection)
+        };
+        pending_release.borrow_mut().take();
+        if !activate {
+            return Propagation::Proceed;
+        }
+        let Some(uri) = uri else {
+            return Propagation::Proceed;
+        };
+
+        let (window, line_count) = {
+            let state = state_click.borrow();
+            (state.logs_window.clone(), state.log_lines.len())
+        };
+
+        match gtk::show_uri_on_window(Some(&window), &uri, event.time()) {
+            Ok(()) => {
+                set_logs_status(&status_click, line_count, Some("opened link"));
+            }
+            Err(err) => {
+                append_log(
+                    &mut state_click.borrow_mut(),
+                    format!("failed to open URL {uri}: {err}"),
+                );
+            }
+        }
+
+        Propagation::Stop
+    });
+
+    let state_motion = state.clone();
+    text_view.connect_motion_notify_event(move |text_view, event| {
+        let active = event.window().and_then(|event_window| {
+            let (x, y) = event.position();
+            iter_at_pointer(text_view, &event_window, x, y).and_then(|iter| {
+                let state = state_motion.borrow();
+                log_link_at_iter(&state, &iter)
+            })
+        });
+
+        set_logs_link_cursor(text_view, active.is_some());
+        Propagation::Proceed
+    });
+
+    let pending_leave = pending_link.clone();
+    text_view.connect_leave_notify_event(move |text_view, _| {
+        pending_leave.borrow_mut().take();
+        set_logs_link_cursor(text_view, false);
+        Propagation::Proceed
     });
 }
 
@@ -2226,6 +2358,207 @@ fn buffer_text(buffer: &gtk::TextBuffer) -> String {
         .to_string()
 }
 
+fn is_log_link_boundary(ch: char) -> bool {
+    !matches!(
+        ch,
+        'a'..='z'
+            | 'A'..='Z'
+            | '0'..='9'
+            | '/'
+            | '_'
+            | '-'
+            | '.'
+            | '?'
+            | '&'
+            | '%'
+            | '#'
+            | '@'
+            | '~'
+            | '+'
+    )
+}
+
+fn log_link_scheme_len(tail: &str) -> Option<usize> {
+    const LOG_LINK_SCHEMES: [&str; 4] = ["https://", "http://", "file://", "mailto:"];
+
+    LOG_LINK_SCHEMES.iter().find_map(|scheme| {
+        tail.get(..scheme.len())
+            .filter(|prefix| prefix.eq_ignore_ascii_case(scheme))
+            .map(|_| scheme.len())
+    })
+}
+
+fn trim_log_link_end(line: &str, start_byte: usize, mut end_byte: usize) -> usize {
+    while end_byte > start_byte {
+        let Some(ch) = line[..end_byte].chars().next_back() else {
+            break;
+        };
+
+        let trim = match ch {
+            '.' | ',' | ';' | '!' | '?' => true,
+            ')' => {
+                let candidate = &line[start_byte..end_byte];
+                candidate.matches(')').count() > candidate.matches('(').count()
+            }
+            ']' => {
+                let candidate = &line[start_byte..end_byte];
+                candidate.matches(']').count() > candidate.matches('[').count()
+            }
+            '}' => {
+                let candidate = &line[start_byte..end_byte];
+                candidate.matches('}').count() > candidate.matches('{').count()
+            }
+            _ => false,
+        };
+
+        if !trim {
+            break;
+        }
+
+        end_byte -= ch.len_utf8();
+    }
+
+    end_byte
+}
+
+fn extract_log_links(line: &str) -> Vec<LogLink> {
+    let mut links = Vec::new();
+    let mut byte_idx = 0usize;
+
+    while byte_idx < line.len() {
+        let tail = &line[byte_idx..];
+        let Some(scheme_len) = log_link_scheme_len(tail) else {
+            let Some(ch) = tail.chars().next() else {
+                break;
+            };
+            byte_idx += ch.len_utf8();
+            continue;
+        };
+
+        if byte_idx > 0 {
+            let prev = line[..byte_idx].chars().next_back().unwrap_or(' ');
+            if !is_log_link_boundary(prev) {
+                byte_idx += scheme_len;
+                continue;
+            }
+        }
+
+        let mut end_byte = byte_idx + scheme_len;
+        while end_byte < line.len() {
+            let Some(ch) = line[end_byte..].chars().next() else {
+                break;
+            };
+            if ch.is_whitespace() || matches!(ch, '<' | '>' | '"' | '\'') {
+                break;
+            }
+            end_byte += ch.len_utf8();
+        }
+
+        end_byte = trim_log_link_end(line, byte_idx, end_byte);
+        if end_byte <= byte_idx + scheme_len {
+            byte_idx += scheme_len;
+            continue;
+        }
+
+        links.push(LogLink {
+            start_char: line[..byte_idx].chars().count() as i32,
+            end_char: line[..end_byte].chars().count() as i32,
+            uri: line[byte_idx..end_byte].to_string(),
+        });
+
+        byte_idx = end_byte;
+    }
+
+    links
+}
+
+fn append_log_line_to_buffer(buffer: &gtk::TextBuffer, line: &str, links: &[LogLink]) {
+    let mut start_iter = buffer.end_iter();
+    let line_start_offset = start_iter.offset();
+    buffer.insert(&mut start_iter, line);
+    let mut end_iter = buffer.end_iter();
+    buffer.insert(&mut end_iter, "\n");
+
+    for link in links {
+        let start = buffer.iter_at_offset(line_start_offset + link.start_char);
+        let end = buffer.iter_at_offset(line_start_offset + link.end_char);
+        buffer.apply_tag_by_name(LOG_LINK_TAG_NAME, &start, &end);
+    }
+}
+
+fn drop_oldest_log_line_from_buffer(buffer: &gtk::TextBuffer) {
+    let mut start = buffer.start_iter();
+    let mut end = start;
+    if end.forward_line() {
+        buffer.delete(&mut start, &mut end);
+    } else {
+        buffer.set_text("");
+    }
+}
+
+fn log_link_at_iter(state: &AppState, iter: &gtk::TextIter) -> Option<String> {
+    let line_idx = usize::try_from(iter.line()).ok()?;
+    let char_offset = iter.line_offset();
+
+    state
+        .log_links
+        .get(line_idx)?
+        .iter()
+        .into_iter()
+        .find(|link| char_offset >= link.start_char && char_offset < link.end_char)
+        .map(|link| link.uri.clone())
+}
+
+fn should_activate_log_link(
+    pending: Option<&PendingLogLink>,
+    released_uri: Option<&str>,
+    release_x: f64,
+    release_y: f64,
+    has_selection: bool,
+) -> bool {
+    let Some(pending) = pending else {
+        return false;
+    };
+    let Some(released_uri) = released_uri else {
+        return false;
+    };
+    if has_selection || pending.uri != released_uri {
+        return false;
+    }
+
+    let dx = release_x - pending.x;
+    let dy = release_y - pending.y;
+    (dx * dx) + (dy * dy) <= LOG_LINK_CLICK_SLOP * LOG_LINK_CLICK_SLOP
+}
+
+fn iter_at_pointer(
+    text_view: &gtk::TextView,
+    event_window: &gdk::Window,
+    x: f64,
+    y: f64,
+) -> Option<gtk::TextIter> {
+    let window_type = text_view.window_type(event_window);
+    let (buffer_x, buffer_y) = text_view.window_to_buffer_coords(window_type, x as i32, y as i32);
+    text_view
+        .iter_at_position(buffer_x, buffer_y)
+        .map(|(iter, _trailing)| iter)
+}
+
+fn set_logs_link_cursor(text_view: &gtk::TextView, active: bool) {
+    let Some(window) = gtk::prelude::TextViewExt::window(text_view, gtk::TextWindowType::Text)
+    else {
+        return;
+    };
+
+    let cursor = if active {
+        gdk::Display::default().and_then(|display| gdk::Cursor::from_name(&display, "pointer"))
+    } else {
+        None
+    };
+
+    window.set_cursor(cursor.as_ref());
+}
+
 fn append_log_to_file(path: &Path, line: &str) -> Result<(), std::io::Error> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -2312,26 +2645,16 @@ fn strip_ansi_codes(line: &str) -> String {
 
 fn append_log(state: &mut AppState, line: String) {
     let clean_line = strip_ansi_codes(&line);
-    let mut rebuild = false;
+    let links = extract_log_links(&clean_line);
     if state.log_lines.len() >= MAX_LOG_LINES {
         state.log_lines.pop_front();
-        rebuild = true;
+        state.log_links.pop_front();
+        drop_oldest_log_line_from_buffer(&state.logs_buffer);
     }
     state.log_lines.push_back(clean_line.clone());
+    state.log_links.push_back(links.clone());
 
-    if rebuild {
-        let payload = state
-            .log_lines
-            .iter()
-            .cloned()
-            .collect::<Vec<String>>()
-            .join("\n");
-        state.logs_buffer.set_text(&payload);
-    } else {
-        let mut end_iter = state.logs_buffer.end_iter();
-        state.logs_buffer.insert(&mut end_iter, &clean_line);
-        state.logs_buffer.insert(&mut end_iter, "\n");
-    }
+    append_log_line_to_buffer(&state.logs_buffer, &clean_line, &links);
 
     let mut end_iter = state.logs_buffer.end_iter();
     state
@@ -3060,7 +3383,10 @@ mod tests {
     fn strip_ansi_codes_removes_csi_sequences() {
         let line = "[\x1b[32mok\x1b[0m] uv                 /usr/bin/uv";
 
-        assert_eq!(strip_ansi_codes(line), "[ok] uv                 /usr/bin/uv");
+        assert_eq!(
+            strip_ansi_codes(line),
+            "[ok] uv                 /usr/bin/uv"
+        );
     }
 
     #[test]
@@ -3075,5 +3401,84 @@ mod tests {
         let line = "left \x1b]8;;https://example.com\x1b\\label\x1b]8;;\x1b\\ right";
 
         assert_eq!(strip_ansi_codes(line), "left label right");
+    }
+
+    #[test]
+    fn extract_log_links_finds_multiple_urls() {
+        let links = extract_log_links("see https://example.com and http://localhost:8000/test");
+
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].uri, "https://example.com");
+        assert_eq!(links[1].uri, "http://localhost:8000/test");
+    }
+
+    #[test]
+    fn extract_log_links_trims_trailing_punctuation() {
+        let links = extract_log_links("docs: https://example.com/test), done");
+
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].uri, "https://example.com/test");
+    }
+
+    #[test]
+    fn extract_log_links_preserves_balanced_parentheses() {
+        let links = extract_log_links("see https://example.com/func(test) now");
+
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].uri, "https://example.com/func(test)");
+    }
+
+    #[test]
+    fn extract_log_links_allows_assignment_prefixes() {
+        let links = extract_log_links("url=https://example.com/path");
+
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].uri, "https://example.com/path");
+    }
+
+    #[test]
+    fn extract_log_links_matches_uppercase_schemes() {
+        let links = extract_log_links("See HTTPS://EXAMPLE.COM/docs for details");
+
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].uri, "HTTPS://EXAMPLE.COM/docs");
+    }
+
+    #[test]
+    fn should_activate_log_link_requires_click_without_selection() {
+        let pending = PendingLogLink {
+            uri: "https://example.com".to_string(),
+            x: 10.0,
+            y: 20.0,
+        };
+
+        assert!(should_activate_log_link(
+            Some(&pending),
+            Some("https://example.com"),
+            12.0,
+            22.0,
+            false,
+        ));
+        assert!(!should_activate_log_link(
+            Some(&pending),
+            Some("https://example.com"),
+            20.0,
+            35.0,
+            false,
+        ));
+        assert!(!should_activate_log_link(
+            Some(&pending),
+            Some("https://example.com"),
+            12.0,
+            22.0,
+            true,
+        ));
+        assert!(!should_activate_log_link(
+            Some(&pending),
+            Some("https://other.example"),
+            12.0,
+            22.0,
+            false,
+        ));
     }
 }
