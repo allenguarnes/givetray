@@ -2238,13 +2238,86 @@ fn append_log_to_file(path: &Path, line: &str) -> Result<(), std::io::Error> {
     writeln!(file, "{line}")
 }
 
+fn strip_ansi_codes(line: &str) -> String {
+    let bytes = line.as_bytes();
+    let mut result = String::with_capacity(line.len());
+    let mut chunk_start = 0usize;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if bytes[i] != 0x1b {
+            i += 1;
+            continue;
+        }
+
+        if chunk_start < i {
+            result.push_str(&line[chunk_start..i]);
+        }
+
+        i += 1;
+        if i >= bytes.len() {
+            chunk_start = i;
+            break;
+        }
+
+        match bytes[i] {
+            b'[' => {
+                i += 1;
+                while i < bytes.len() {
+                    if (0x40..=0x7e).contains(&bytes[i]) {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b']' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == 0x07 {
+                        i += 1;
+                        break;
+                    }
+                    if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'P' | b'X' | b'^' | b'_' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {
+                i += 1;
+            }
+        }
+
+        chunk_start = i;
+    }
+
+    if chunk_start < line.len() {
+        result.push_str(&line[chunk_start..]);
+    }
+
+    result
+}
+
 fn append_log(state: &mut AppState, line: String) {
+    let clean_line = strip_ansi_codes(&line);
     let mut rebuild = false;
     if state.log_lines.len() >= MAX_LOG_LINES {
         state.log_lines.pop_front();
         rebuild = true;
     }
-    state.log_lines.push_back(line.clone());
+    state.log_lines.push_back(clean_line.clone());
 
     if rebuild {
         let payload = state
@@ -2256,7 +2329,7 @@ fn append_log(state: &mut AppState, line: String) {
         state.logs_buffer.set_text(&payload);
     } else {
         let mut end_iter = state.logs_buffer.end_iter();
-        state.logs_buffer.insert(&mut end_iter, &line);
+        state.logs_buffer.insert(&mut end_iter, &clean_line);
         state.logs_buffer.insert(&mut end_iter, "\n");
     }
 
@@ -2268,7 +2341,7 @@ fn append_log(state: &mut AppState, line: String) {
     set_logs_status(&state.logs_status_label, state.log_lines.len(), None);
 
     if let Some(path) = state.log_file_path.as_ref() {
-        if let Err(err) = append_log_to_file(path, &line) {
+        if let Err(err) = append_log_to_file(path, &clean_line) {
             eprintln!("failed to write log file at {}: {err}", path.display());
         }
     }
@@ -2981,5 +3054,26 @@ mod tests {
 
         assert_eq!(startup.config.command, "printf ready");
         assert!(startup.persistent_config_access.is_some());
+    }
+
+    #[test]
+    fn strip_ansi_codes_removes_csi_sequences() {
+        let line = "[\x1b[32mok\x1b[0m] uv                 /usr/bin/uv";
+
+        assert_eq!(strip_ansi_codes(line), "[ok] uv                 /usr/bin/uv");
+    }
+
+    #[test]
+    fn strip_ansi_codes_removes_osc_sequences() {
+        let line = "prefix \x1b]0;givetray test\x07suffix";
+
+        assert_eq!(strip_ansi_codes(line), "prefix suffix");
+    }
+
+    #[test]
+    fn strip_ansi_codes_removes_st_terminated_escape_sequences() {
+        let line = "left \x1b]8;;https://example.com\x1b\\label\x1b]8;;\x1b\\ right";
+
+        assert_eq!(strip_ansi_codes(line), "left label right");
     }
 }
