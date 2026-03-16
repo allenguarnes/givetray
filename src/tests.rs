@@ -1120,3 +1120,148 @@ fn startup_reconcile_invalid_runtime_state_falls_back_to_stopped() {
     assert!(reconciled.runtime_ownership.is_none());
     assert!(state_path.exists());
 }
+
+mod process_group_launch {
+    use super::*;
+
+    #[test]
+    fn spawn_in_new_process_group_creates_separate_pgid() {
+        let mut result =
+            crate::process::spawn_command_in_new_process_group("sleep", &["0".to_string()], false)
+                .expect("spawn should succeed");
+
+        assert!(result.owned_pid > 0, "owned_pid should be set");
+        assert!(result.owned_pgid > 0, "owned_pgid should be set");
+
+        let pgid_matches = unsafe { libc::getpgid(result.owned_pid as libc::pid_t) };
+        assert!(pgid_matches >= 0, "pgid should be retrievable");
+        assert_eq!(
+            pgid_matches, result.owned_pgid as libc::pid_t,
+            "child's pgid should match owned_pgid"
+        );
+
+        let _ = result.child.kill();
+        let _ = result.child.wait();
+    }
+
+    #[test]
+    fn spawn_in_new_process_group_pgid_differs_from_parent() {
+        let parent_pgid = unsafe { libc::getpgid(0) };
+
+        let mut result =
+            crate::process::spawn_command_in_new_process_group("sleep", &["0".to_string()], false)
+                .expect("spawn should succeed");
+
+        assert_ne!(
+            result.owned_pgid as libc::pid_t, parent_pgid,
+            "child's pgid should differ from parent's pgid"
+        );
+
+        let _ = result.child.kill();
+        let _ = result.child.wait();
+    }
+
+    #[test]
+    fn persist_launch_metadata_saves_to_profile_path() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock should be acquired");
+        let temp_root = unique_test_dir("persist-metadata-profile");
+        fs::create_dir_all(&temp_root).expect("temp root should be created");
+        let _env = TestEnvGuard::set(&temp_root);
+
+        let state_path =
+            runtime_state_path_for_profile("testprofile").expect("path should resolve");
+
+        crate::process::persist_launch_metadata(
+            &Some(state_path.clone()),
+            "echo hello",
+            12345,
+            12345,
+            Some("testprofile"),
+            false,
+        )
+        .expect("persist should succeed");
+
+        let loaded = load_runtime_state(&state_path).expect("state should load");
+        assert_eq!(loaded.pid, 12345);
+        assert_eq!(loaded.pgid, 12345);
+        assert_eq!(loaded.profile_name.as_deref(), Some("testprofile"));
+        assert!(!loaded.ephemeral);
+        assert_eq!(loaded.command_label, "echo hello");
+    }
+
+    #[test]
+    fn persist_launch_metadata_saves_to_ephemeral_path() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock should be acquired");
+        let temp_root = unique_test_dir("persist-metadata-ephemeral");
+        fs::create_dir_all(&temp_root).expect("temp root should be created");
+        let _env = TestEnvGuard::set(&temp_root);
+
+        let state_path = runtime_state_path_for_ephemeral().expect("path should resolve");
+
+        crate::process::persist_launch_metadata(
+            &Some(state_path.clone()),
+            "echo ephemeral",
+            54321,
+            54321,
+            None,
+            true,
+        )
+        .expect("persist should succeed");
+
+        let loaded = load_runtime_state(&state_path).expect("state should load");
+        assert_eq!(loaded.pid, 54321);
+        assert_eq!(loaded.pgid, 54321);
+        assert!(loaded.profile_name.is_none());
+        assert!(loaded.ephemeral);
+        assert_eq!(loaded.command_label, "echo ephemeral");
+    }
+
+    #[test]
+    fn persist_launch_metadata_overwrites_existing() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock should be acquired");
+        let temp_root = unique_test_dir("persist-overwrite");
+        fs::create_dir_all(&temp_root).expect("temp root should be created");
+        let _env = TestEnvGuard::set(&temp_root);
+
+        let state_path = runtime_state_path_for_profile("overwrite").expect("path should resolve");
+
+        let old_state = RuntimeOwnershipState {
+            pid: 11111,
+            pgid: 11111,
+            started_at_unix_ms: 1000,
+            command_label: "old command".to_string(),
+            profile_name: Some("overwrite".to_string()),
+            ephemeral: false,
+        };
+        save_runtime_state(&state_path, &old_state).expect("old state should save");
+
+        crate::process::persist_launch_metadata(
+            &Some(state_path.clone()),
+            "new command",
+            22222,
+            22222,
+            Some("overwrite"),
+            false,
+        )
+        .expect("persist should succeed");
+
+        let loaded = load_runtime_state(&state_path).expect("state should load");
+        assert_eq!(loaded.pid, 22222);
+        assert_eq!(loaded.pgid, 22222);
+        assert_eq!(loaded.command_label, "new command");
+    }
+
+    #[test]
+    fn persist_launch_metadata_fails_without_path() {
+        let result = crate::process::persist_launch_metadata(
+            &None,
+            "echo test",
+            12345,
+            12345,
+            Some("test"),
+            false,
+        );
+
+        assert!(result.is_err());
+    }
+}

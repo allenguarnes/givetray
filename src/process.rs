@@ -1,13 +1,13 @@
-use crate::{AppState, RuntimeOwnershipState, UiEvent, BG_CHILD_ENV};
+use crate::{config::save_runtime_state, AppState, RuntimeOwnershipState, UiEvent, BG_CHILD_ENV};
 use async_channel::Sender;
 use gtk::prelude::*;
 use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use zeroize::Zeroizing;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +37,84 @@ where
 
 pub fn is_process_group_alive(pgid: i32) -> bool {
     unsafe { libc::kill(pgid, 0) == 0 }
+}
+
+pub struct SpawnResult {
+    pub child: Child,
+    pub owned_pid: u32,
+    pub owned_pgid: i32,
+}
+
+pub fn spawn_command_in_new_process_group(
+    program: &str,
+    args: &[String],
+    stdinpiped: bool,
+) -> Result<SpawnResult, String> {
+    let mut cmd = Command::new(program);
+    cmd.env_remove(BG_CHILD_ENV);
+    if !args.is_empty() {
+        cmd.args(args);
+    }
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    if stdinpiped {
+        cmd.stdin(Stdio::piped());
+    }
+
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|err| format!("failed to start command: {err}"))?;
+
+    let pid = child.id();
+    let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
+    if pgid == -1 {
+        return Err("failed to get process group id".to_string());
+    }
+
+    Ok(SpawnResult {
+        child,
+        owned_pid: pid,
+        owned_pgid: pgid as i32,
+    })
+}
+
+pub fn persist_launch_metadata(
+    runtime_state_path: &Option<PathBuf>,
+    command: &str,
+    owned_pid: u32,
+    owned_pgid: i32,
+    profile_name: Option<&str>,
+    ephemeral: bool,
+) -> Result<(), String> {
+    let runtime_state_path = runtime_state_path
+        .as_ref()
+        .ok_or("runtime state path not set")?;
+
+    let started_at_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "system time before epoch")?
+        .as_millis() as u64;
+
+    let state = RuntimeOwnershipState {
+        pid: owned_pid,
+        pgid: owned_pgid as u32,
+        started_at_unix_ms,
+        command_label: command.to_string(),
+        profile_name: profile_name.map(String::from),
+        ephemeral,
+    };
+
+    save_runtime_state(runtime_state_path, &state)
 }
 
 pub(crate) fn start_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>) {
@@ -73,29 +151,17 @@ pub(crate) fn start_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>
         None
     };
 
-    let mut cmd = Command::new(&args[0]);
-    cmd.env_remove(BG_CHILD_ENV);
-    if args.len() > 1 {
-        cmd.args(&args[1..]);
-    }
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-    if sudo_password.is_some() {
-        cmd.stdin(Stdio::piped());
-    }
-
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(err) => {
-            let _ = ui_tx.send_blocking(UiEvent::AppendLog(format!(
-                "failed to start command: {err}"
-            )));
-            return;
-        }
-    };
+    let mut spawn_result =
+        match spawn_command_in_new_process_group(&args[0], &args[1..], sudo_password.is_some()) {
+            Ok(result) => result,
+            Err(err) => {
+                let _ = ui_tx.send_blocking(UiEvent::AppendLog(err));
+                return;
+            }
+        };
 
     if let Some(password) = sudo_password {
-        if let Some(mut stdin) = child.stdin.take() {
+        if let Some(mut stdin) = spawn_result.child.stdin.take() {
             if let Err(err) = stdin
                 .write_all(password.as_bytes())
                 .and_then(|_| stdin.write_all(b"\n"))
@@ -111,14 +177,40 @@ pub(crate) fn start_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>
         }
     }
 
-    if let Some(stdout) = child.stdout.take() {
+    if let Some(stdout) = spawn_result.child.stdout.take() {
         spawn_reader(stdout, ui_tx.clone());
     }
-    if let Some(stderr) = child.stderr.take() {
+    if let Some(stderr) = spawn_result.child.stderr.take() {
         spawn_reader(stderr, ui_tx.clone());
     }
 
-    state.borrow_mut().child = Some(child);
+    let runtime_state_path = state.borrow().runtime_state_path.clone();
+    let profile_name = state
+        .borrow()
+        .persistent_config_access
+        .as_ref()
+        .map(|a| a.profile.as_str())
+        .map(String::from);
+    let ephemeral = profile_name.is_none();
+    let profile_name_owned = profile_name.as_deref();
+
+    if let Err(err) = persist_launch_metadata(
+        &runtime_state_path,
+        &command,
+        spawn_result.owned_pid,
+        spawn_result.owned_pgid,
+        profile_name_owned,
+        ephemeral,
+    ) {
+        let _ = ui_tx.send_blocking(UiEvent::AppendLog(format!(
+            "failed to persist runtime state: {err}"
+        )));
+    }
+
+    state.borrow_mut().child = Some(spawn_result.child);
+    state.borrow_mut().owned_pid = Some(spawn_result.owned_pid);
+    state.borrow_mut().owned_pgid = Some(spawn_result.owned_pgid);
+
     let _ = ui_tx.send_blocking(UiEvent::SetRunning(true));
     let _ = ui_tx.send_blocking(UiEvent::AppendLog("command started".to_string()));
 }
