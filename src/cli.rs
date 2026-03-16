@@ -167,6 +167,9 @@ pub(crate) fn build_startup_state(cli: &CliOptions) -> Result<StartupState, Stri
                 log_file_path: resolve_log_file_path(profile, &config),
                 launch_on_startup: config.autostart,
                 config,
+                runtime_state_path: None,
+                runtime_ownership: None,
+                restored_running: false,
             })
         }
         CliRunTarget::EphemeralArgv { argv } => Ok(StartupState {
@@ -175,6 +178,9 @@ pub(crate) fn build_startup_state(cli: &CliOptions) -> Result<StartupState, Stri
             config: ephemeral_runtime_config(argv),
             log_file_path: None,
             launch_on_startup: true,
+            runtime_state_path: None,
+            runtime_ownership: None,
+            restored_running: false,
         }),
     }
 }

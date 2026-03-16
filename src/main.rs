@@ -137,6 +137,10 @@ struct AppState {
     saved_log_to_file: bool,
     saved_log_file_path: Option<String>,
     child: Option<Child>,
+    owned_pgid: Option<i32>,
+    owned_pid: Option<u32>,
+    runtime_state_path: Option<PathBuf>,
+    restored_running: bool,
     log_lines: VecDeque<String>,
     log_links: VecDeque<Vec<LogLink>>,
     log_file_path: Option<PathBuf>,
@@ -192,6 +196,9 @@ struct StartupState {
     config: Config,
     log_file_path: Option<PathBuf>,
     launch_on_startup: bool,
+    runtime_state_path: Option<PathBuf>,
+    runtime_ownership: Option<RuntimeOwnershipState>,
+    restored_running: bool,
 }
 
 enum ConfigCloseAction {
@@ -326,6 +333,10 @@ fn main() {
         saved_log_to_file: startup.config.log_to_file,
         saved_log_file_path: startup.config.log_file_path.clone(),
         child: None,
+        owned_pgid: startup.runtime_ownership.as_ref().map(|o| o.pgid as i32),
+        owned_pid: startup.runtime_ownership.as_ref().map(|o| o.pid),
+        runtime_state_path: startup.runtime_state_path,
+        restored_running: startup.restored_running,
         log_lines: VecDeque::new(),
         log_links: VecDeque::new(),
         log_file_path: startup.log_file_path,

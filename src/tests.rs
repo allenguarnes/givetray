@@ -406,6 +406,9 @@ fn ephemeral_mode_hides_configuration_menu() {
         config: ephemeral_runtime_config(&["echo".to_string()]),
         log_file_path: None,
         launch_on_startup: true,
+        runtime_state_path: None,
+        runtime_ownership: None,
+        restored_running: false,
     };
 
     assert!(!should_expose_configuration(
@@ -430,6 +433,9 @@ fn persistent_mode_exposes_configuration_menu() {
         },
         log_file_path: None,
         launch_on_startup: false,
+        runtime_state_path: None,
+        runtime_ownership: None,
+        restored_running: false,
     };
 
     assert!(should_expose_configuration(
@@ -478,6 +484,9 @@ fn persistent_startup_state_exposes_configuration_from_source_of_truth() {
         },
         log_file_path: None,
         launch_on_startup: false,
+        runtime_state_path: None,
+        runtime_ownership: None,
+        restored_running: false,
     };
 
     assert!(should_expose_configuration(
@@ -861,4 +870,104 @@ fn reconcile_runtime_state_ignores_invalid_metadata() {
 
     let result = reconcile_runtime_state(&state, is_process_group_alive);
     assert!(matches!(result, RuntimeReconcileResult::IgnoreInvalid));
+}
+
+#[test]
+fn startup_runtime_state_no_state_stops() {
+    let startup = StartupState {
+        profile_label: "default".to_string(),
+        persistent_config_access: Some(PersistentConfigAccess {
+            profile: "default".to_string(),
+            config_path: PathBuf::from("/tmp/default.toml"),
+        }),
+        config: Config {
+            command: "echo test".to_string(),
+            autostart: false,
+            icon_path: None,
+            log_to_file: false,
+            log_file_path: None,
+        },
+        log_file_path: None,
+        launch_on_startup: false,
+        runtime_state_path: None,
+        runtime_ownership: None,
+        restored_running: false,
+    };
+
+    assert!(startup.runtime_state_path.is_none());
+    assert!(startup.runtime_ownership.is_none());
+    assert!(!startup.restored_running);
+}
+
+#[test]
+fn startup_runtime_state_recovered_running() {
+    let ownership = RuntimeOwnershipState {
+        pid: 12345,
+        pgid: 12345,
+        started_at_unix_ms: 1000,
+        command_label: "sleep 60".to_string(),
+        profile_name: Some("default".to_string()),
+        ephemeral: false,
+    };
+
+    let startup = StartupState {
+        profile_label: "default".to_string(),
+        persistent_config_access: Some(PersistentConfigAccess {
+            profile: "default".to_string(),
+            config_path: PathBuf::from("/tmp/default.toml"),
+        }),
+        config: Config {
+            command: "sleep 60".to_string(),
+            autostart: false,
+            icon_path: None,
+            log_to_file: false,
+            log_file_path: None,
+        },
+        log_file_path: None,
+        launch_on_startup: false,
+        runtime_state_path: Some(PathBuf::from("/tmp/runtime-state.toml")),
+        runtime_ownership: Some(ownership),
+        restored_running: true,
+    };
+
+    assert!(startup.runtime_state_path.is_some());
+    assert!(startup.runtime_ownership.is_some());
+    assert!(startup.restored_running);
+    assert_eq!(startup.runtime_ownership.as_ref().unwrap().pid, 12345);
+}
+
+#[test]
+fn startup_runtime_state_stale_clears() {
+    let ownership = RuntimeOwnershipState {
+        pid: 99999,
+        pgid: 99999,
+        started_at_unix_ms: 1000,
+        command_label: "sleep 60".to_string(),
+        profile_name: Some("default".to_string()),
+        ephemeral: false,
+    };
+
+    let startup = StartupState {
+        profile_label: "default".to_string(),
+        persistent_config_access: Some(PersistentConfigAccess {
+            profile: "default".to_string(),
+            config_path: PathBuf::from("/tmp/default.toml"),
+        }),
+        config: Config {
+            command: "sleep 60".to_string(),
+            autostart: false,
+            icon_path: None,
+            log_to_file: false,
+            log_file_path: None,
+        },
+        log_file_path: None,
+        launch_on_startup: false,
+        runtime_state_path: Some(PathBuf::from("/tmp/runtime-state.toml")),
+        runtime_ownership: Some(ownership),
+        restored_running: false,
+    };
+
+    assert!(startup.runtime_state_path.is_some());
+    assert!(startup.runtime_ownership.is_some());
+    assert!(!startup.restored_running);
 }
