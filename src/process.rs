@@ -1,4 +1,4 @@
-use crate::{AppState, UiEvent, BG_CHILD_ENV};
+use crate::{AppState, RuntimeOwnershipState, UiEvent, BG_CHILD_ENV};
 use async_channel::Sender;
 use gtk::prelude::*;
 use std::cell::RefCell;
@@ -9,6 +9,35 @@ use std::rc::Rc;
 use std::thread;
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeReconcileResult {
+    RestoreRunning,
+    ClearStale,
+    IgnoreInvalid,
+}
+
+pub fn reconcile_runtime_state<F>(
+    state: &RuntimeOwnershipState,
+    is_group_alive: F,
+) -> RuntimeReconcileResult
+where
+    F: FnOnce(i32) -> bool,
+{
+    if state.pid == 0 || state.pgid == 0 {
+        return RuntimeReconcileResult::IgnoreInvalid;
+    }
+
+    if is_group_alive(state.pgid as i32) {
+        RuntimeReconcileResult::RestoreRunning
+    } else {
+        RuntimeReconcileResult::ClearStale
+    }
+}
+
+pub fn is_process_group_alive(pgid: i32) -> bool {
+    unsafe { libc::kill(pgid, 0) == 0 }
+}
 
 pub(crate) fn start_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>) {
     if state.borrow().child.is_some() {

@@ -12,7 +12,9 @@ use crate::config::{
 use crate::logs::{
     append_log_to_file, extract_log_links, should_activate_log_link, strip_ansi_codes,
 };
-use crate::RuntimeOwnershipState;
+use crate::process::is_process_group_alive;
+use crate::process::reconcile_runtime_state;
+use crate::process::RuntimeReconcileResult;
 use crate::*;
 use std::env;
 use std::fs;
@@ -814,4 +816,49 @@ fn runtime_ownership_state_validates_command_label_length() {
         .expect_err("oversized command_label should fail validation");
     assert!(err.contains("command_label"));
     assert!(err.contains("maximum length"));
+}
+
+#[test]
+fn reconcile_runtime_state_restores_running_when_group_is_alive() {
+    let state = RuntimeOwnershipState {
+        pid: std::process::id(),
+        pgid: std::process::id(),
+        started_at_unix_ms: 1000,
+        command_label: "sleep 30".to_string(),
+        profile_name: Some("default".to_string()),
+        ephemeral: false,
+    };
+
+    let result = reconcile_runtime_state(&state, is_process_group_alive);
+    assert!(matches!(result, RuntimeReconcileResult::RestoreRunning));
+}
+
+#[test]
+fn reconcile_runtime_state_clears_stale_when_group_is_missing() {
+    let state = RuntimeOwnershipState {
+        pid: 1234,
+        pgid: 1234,
+        started_at_unix_ms: 1000,
+        command_label: "sleep 30".to_string(),
+        profile_name: Some("default".to_string()),
+        ephemeral: false,
+    };
+
+    let result = reconcile_runtime_state(&state, |_pgid| false);
+    assert!(matches!(result, RuntimeReconcileResult::ClearStale));
+}
+
+#[test]
+fn reconcile_runtime_state_ignores_invalid_metadata() {
+    let state = RuntimeOwnershipState {
+        pid: 0,
+        pgid: 0,
+        started_at_unix_ms: 1000,
+        command_label: "sleep 30".to_string(),
+        profile_name: Some("default".to_string()),
+        ephemeral: false,
+    };
+
+    let result = reconcile_runtime_state(&state, is_process_group_alive);
+    assert!(matches!(result, RuntimeReconcileResult::IgnoreInvalid));
 }
