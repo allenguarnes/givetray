@@ -4,7 +4,10 @@ use crate::cli::{
     persistent_config_access, prepare_run_startup_with, should_expose_configuration, tray_tooltip,
     validate_runtime_mode,
 };
-use crate::config::config_path_for_profile;
+use crate::config::{
+    clear_runtime_state, config_path_for_profile, load_runtime_state,
+    runtime_state_path_for_ephemeral, runtime_state_path_for_profile, save_runtime_state,
+};
 use crate::logs::{
     append_log_to_file, extract_log_links, should_activate_log_link, strip_ansi_codes,
 };
@@ -632,4 +635,167 @@ fn append_log_to_file_reuses_writer_across_calls() {
         .expect("log file should be readable");
 
     assert_eq!(contents, "first line\nsecond line\n");
+}
+
+#[test]
+fn runtime_state_round_trips_for_profile_run() {
+    let state = RuntimeOwnershipState {
+        pid: 1234,
+        pgid: 1234,
+        started_at_unix_ms: 1000,
+        command_label: "sleep 30".to_string(),
+        profile_name: Some("default".to_string()),
+        ephemeral: false,
+    };
+
+    let encoded = toml::to_string(&state).expect("state should serialize");
+    let decoded: RuntimeOwnershipState =
+        toml::from_str(&encoded).expect("state should deserialize");
+
+    assert_eq!(decoded.profile_name.as_deref(), Some("default"));
+    assert_eq!(decoded.pgid, 1234);
+    assert!(!decoded.ephemeral);
+}
+
+#[test]
+fn runtime_state_round_trips_for_ephemeral_run() {
+    let state = RuntimeOwnershipState {
+        pid: 5678,
+        pgid: 5678,
+        started_at_unix_ms: 2000,
+        command_label: "echo hello".to_string(),
+        profile_name: None,
+        ephemeral: true,
+    };
+
+    let encoded = toml::to_string(&state).expect("state should serialize");
+    let decoded: RuntimeOwnershipState =
+        toml::from_str(&encoded).expect("state should deserialize");
+
+    assert_eq!(decoded.profile_name, None);
+    assert_eq!(decoded.pid, 5678);
+    assert!(decoded.ephemeral);
+}
+
+#[test]
+fn invalid_runtime_state_toml_returns_none() {
+    let temp_root = unique_test_dir("invalid-runtime-state");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let state_path = temp_root.join("runtime-state.toml");
+
+    fs::write(&state_path, "invalid toml content {").expect("invalid file should be written");
+
+    let loaded = load_runtime_state(&state_path);
+    assert!(loaded.is_none(), "invalid TOML should return None");
+}
+
+#[test]
+fn missing_runtime_state_file_returns_none() {
+    let temp_root = unique_test_dir("missing-runtime-state");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let state_path = temp_root.join("nonexistent.toml");
+
+    let loaded = load_runtime_state(&state_path);
+    assert!(loaded.is_none(), "missing file should return None");
+}
+
+#[test]
+fn runtime_state_path_resolves_for_profile() {
+    let _env_lock = ENV_LOCK.lock().expect("env lock should be acquired");
+    let temp_root = unique_test_dir("runtime-state-profile-path");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let path = runtime_state_path_for_profile("default");
+    assert!(path.is_some(), "profile path should resolve");
+
+    let path = path.unwrap();
+    assert!(
+        path.to_string_lossy().contains("default"),
+        "path should contain profile name"
+    );
+    assert!(
+        path.to_string_lossy().ends_with(".toml"),
+        "path should be a toml file"
+    );
+}
+
+#[test]
+fn runtime_state_path_resolves_for_ephemeral() {
+    let temp_root = unique_test_dir("runtime-state-ephemeral-path");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let path = runtime_state_path_for_ephemeral();
+    assert!(path.is_some(), "ephemeral path should resolve");
+
+    let path = path.unwrap();
+    assert!(
+        path.to_string_lossy().ends_with("ephemeral.toml"),
+        "path should be ephemeral.toml"
+    );
+}
+
+#[test]
+fn save_and_load_runtime_state_round_trip() {
+    let temp_root = unique_test_dir("save-load-runtime-state");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let state_path = temp_root.join("runtime-state.toml");
+
+    let state = RuntimeOwnershipState {
+        pid: 9999,
+        pgid: 9999,
+        started_at_unix_ms: 5000,
+        command_label: "test command".to_string(),
+        profile_name: Some("testprofile".to_string()),
+        ephemeral: false,
+    };
+
+    save_runtime_state(&state_path, &state).expect("save should succeed");
+
+    let loaded = load_runtime_state(&state_path);
+    assert!(loaded.is_some(), "loaded state should exist");
+
+    let loaded = loaded.unwrap();
+    assert_eq!(loaded.pid, 9999);
+    assert_eq!(loaded.pgid, 9999);
+    assert_eq!(loaded.started_at_unix_ms, 5000);
+    assert_eq!(loaded.command_label, "test command");
+    assert_eq!(loaded.profile_name.as_deref(), Some("testprofile"));
+    assert!(!loaded.ephemeral);
+}
+
+#[test]
+fn clear_runtime_state_removes_file() {
+    let temp_root = unique_test_dir("clear-runtime-state");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let state_path = temp_root.join("runtime-state.toml");
+
+    let state = RuntimeOwnershipState {
+        pid: 1111,
+        pgid: 1111,
+        started_at_unix_ms: 6000,
+        command_label: "clear test".to_string(),
+        profile_name: None,
+        ephemeral: true,
+    };
+
+    save_runtime_state(&state_path, &state).expect("save should succeed");
+    assert!(state_path.exists(), "state file should exist after save");
+
+    clear_runtime_state(&state_path).expect("clear should succeed");
+    assert!(
+        !state_path.exists(),
+        "state file should be removed after clear"
+    );
+}
+
+#[test]
+fn clear_nonexistent_runtime_state_succeeds() {
+    let temp_root = unique_test_dir("clear-nonexistent-runtime-state");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let state_path = temp_root.join("nonexistent.toml");
+
+    let result = clear_runtime_state(&state_path);
+    assert!(result.is_ok(), "clearing nonexistent file should succeed");
 }

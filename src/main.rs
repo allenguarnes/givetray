@@ -94,6 +94,16 @@ struct Config {
     log_file_path: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct RuntimeOwnershipState {
+    pid: u32,
+    pgid: i32,
+    started_at_unix_ms: u64,
+    command_label: String,
+    profile_name: Option<String>,
+    ephemeral: bool,
+}
+
 enum UiEvent {
     AppendLog(String),
     ProcessExited(Option<i32>),

@@ -1,11 +1,13 @@
 use crate::desktop::copy_icon_to_profile;
 use crate::logs::append_log;
-use crate::{AppState, CliOptions, Config, APP_NAME, DEFAULT_COMMAND, DEFAULT_PROFILE};
+use crate::{
+    AppState, CliOptions, Config, RuntimeOwnershipState, APP_NAME, DEFAULT_COMMAND, DEFAULT_PROFILE,
+};
 use directories::ProjectDirs;
 use gtk::prelude::*;
 use std::cell::RefCell;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 pub(crate) fn config_path_for_profile(profile: &str) -> Option<PathBuf> {
@@ -97,6 +99,49 @@ pub(crate) fn sanitize_profile_name(profile: &str) -> String {
         cleaned = DEFAULT_PROFILE.to_string();
     }
     cleaned
+}
+
+pub(crate) fn runtime_state_path_for_profile(profile: &str) -> Option<PathBuf> {
+    ProjectDirs::from("com", APP_NAME, APP_NAME).map(|proj| {
+        proj.data_local_dir()
+            .join("runtime")
+            .join(format!("{}.toml", sanitize_profile_name(profile)))
+    })
+}
+
+pub(crate) fn runtime_state_path_for_ephemeral() -> Option<PathBuf> {
+    ProjectDirs::from("com", APP_NAME, APP_NAME)
+        .map(|proj| proj.data_local_dir().join("runtime").join("ephemeral.toml"))
+}
+
+pub(crate) fn load_runtime_state(path: &Path) -> Option<RuntimeOwnershipState> {
+    let content = match fs::read_to_string(path) {
+        Ok(data) => data,
+        Err(_) => return None,
+    };
+
+    match toml::from_str(&content) {
+        Ok(state) => Some(state),
+        Err(_) => None,
+    }
+}
+
+pub(crate) fn save_runtime_state(path: &Path, state: &RuntimeOwnershipState) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| format!("failed to create runtime dir: {err}"))?;
+    }
+
+    let payload = toml::to_string_pretty(state)
+        .map_err(|err| format!("failed to serialize runtime state: {err}"))?;
+    fs::write(path, payload).map_err(|err| format!("failed to write runtime state: {err}"))?;
+    Ok(())
+}
+
+pub(crate) fn clear_runtime_state(path: &Path) -> Result<(), String> {
+    if path.exists() {
+        fs::remove_file(path).map_err(|err| format!("failed to remove runtime state: {err}"))?;
+    }
+    Ok(())
 }
 
 pub(crate) fn apply_cli_overrides_to_config(
