@@ -25,6 +25,34 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::{exit, Child};
 use std::rc::Rc;
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct RuntimeOwnershipState {
+    pub pid: u32,
+    pub pgid: u32,
+    pub started_at_unix_ms: u64,
+    pub command_label: String,
+    pub profile_name: Option<String>,
+    pub ephemeral: bool,
+}
+
+impl RuntimeOwnershipState {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.pid == 0 {
+            return Err("pid must be greater than 0".to_string());
+        }
+        if self.pgid == 0 {
+            return Err("pgid must be greater than 0".to_string());
+        }
+        if self.command_label.len() > MAX_COMMAND_LENGTH {
+            return Err(format!(
+                "command_label exceeds maximum length of {} bytes",
+                MAX_COMMAND_LENGTH
+            ));
+        }
+        Ok(())
+    }
+}
 use tray_icon::menu::{Menu, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::TrayIconBuilder;
 

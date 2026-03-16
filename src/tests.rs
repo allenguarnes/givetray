@@ -5,9 +5,14 @@ use crate::cli::{
     validate_runtime_mode,
 };
 use crate::config::config_path_for_profile;
+use crate::config::{
+    clear_runtime_state, load_runtime_state, runtime_state_path_for_ephemeral,
+    runtime_state_path_for_profile, save_runtime_state,
+};
 use crate::logs::{
     append_log_to_file, extract_log_links, should_activate_log_link, strip_ansi_codes,
 };
+use crate::RuntimeOwnershipState;
 use crate::*;
 use std::env;
 use std::fs;
@@ -632,4 +637,181 @@ fn append_log_to_file_reuses_writer_across_calls() {
         .expect("log file should be readable");
 
     assert_eq!(contents, "first line\nsecond line\n");
+}
+
+#[test]
+fn runtime_state_round_trips_for_profile_run() {
+    let state = RuntimeOwnershipState {
+        pid: 1234,
+        pgid: 1234,
+        started_at_unix_ms: 1000,
+        command_label: "sleep 30".to_string(),
+        profile_name: Some("default".to_string()),
+        ephemeral: false,
+    };
+
+    let encoded = toml::to_string(&state).expect("state should serialize");
+    let decoded: RuntimeOwnershipState =
+        toml::from_str(&encoded).expect("state should deserialize");
+
+    assert_eq!(decoded.profile_name.as_deref(), Some("default"));
+    assert_eq!(decoded.pgid, 1234);
+    assert!(!decoded.ephemeral);
+}
+
+#[test]
+fn runtime_state_round_trips_for_ephemeral_run() {
+    let state = RuntimeOwnershipState {
+        pid: 5678,
+        pgid: 5678,
+        started_at_unix_ms: 2000,
+        command_label: "echo hello".to_string(),
+        profile_name: None,
+        ephemeral: true,
+    };
+
+    let encoded = toml::to_string(&state).expect("state should serialize");
+    let decoded: RuntimeOwnershipState =
+        toml::from_str(&encoded).expect("state should deserialize");
+
+    assert_eq!(decoded.profile_name, None);
+    assert_eq!(decoded.pid, 5678);
+    assert!(decoded.ephemeral);
+}
+
+#[test]
+fn invalid_runtime_state_toml_returns_none() {
+    let temp_dir = unique_test_dir("invalid-runtime-state");
+    fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+    let state_path = temp_dir.join("runtime-state.toml");
+
+    fs::write(&state_path, "invalid toml content {{{{").expect("invalid file should be written");
+
+    let result = load_runtime_state(&state_path);
+    assert!(result.is_none());
+}
+
+#[test]
+fn runtime_state_path_resolves_for_profile() {
+    let _env_lock = ENV_LOCK.lock().expect("env lock should be acquired");
+    let temp_root = unique_test_dir("runtime-state-profile-path");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let path = runtime_state_path_for_profile("my-profile");
+
+    assert!(path.is_some());
+    let path = path.unwrap();
+    assert!(path.to_string_lossy().contains("my-profile"));
+}
+
+#[test]
+fn runtime_state_path_resolves_for_ephemeral() {
+    let _env_lock = ENV_LOCK.lock().expect("env lock should be acquired");
+    let temp_root = unique_test_dir("runtime-state-ephemeral-path");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let path = runtime_state_path_for_ephemeral();
+
+    assert!(path.is_some());
+}
+
+#[test]
+fn save_and_load_runtime_state() {
+    let temp_root = unique_test_dir("save-load-runtime-state");
+    fs::create_dir_all(&temp_root).expect("temp dir should be created");
+    let state_path = temp_root.join("runtime-state.toml");
+
+    let state = RuntimeOwnershipState {
+        pid: 9999,
+        pgid: 9999,
+        started_at_unix_ms: 3000,
+        command_label: "test command".to_string(),
+        profile_name: Some("testprofile".to_string()),
+        ephemeral: false,
+    };
+
+    save_runtime_state(&state_path, &state).expect("save should succeed");
+
+    let loaded = load_runtime_state(&state_path);
+    assert!(loaded.is_some());
+    let loaded = loaded.unwrap();
+    assert_eq!(loaded.pid, 9999);
+    assert_eq!(loaded.pgid, 9999);
+    assert_eq!(loaded.profile_name.as_deref(), Some("testprofile"));
+}
+
+#[test]
+fn clear_runtime_state_removes_file() {
+    let temp_root = unique_test_dir("clear-runtime-state");
+    fs::create_dir_all(&temp_root).expect("temp dir should be created");
+    let state_path = temp_root.join("runtime-state.toml");
+
+    let state = RuntimeOwnershipState {
+        pid: 1111,
+        pgid: 1111,
+        started_at_unix_ms: 4000,
+        command_label: "to be cleared".to_string(),
+        profile_name: None,
+        ephemeral: true,
+    };
+
+    save_runtime_state(&state_path, &state).expect("save should succeed");
+    assert!(state_path.exists());
+
+    clear_runtime_state(&state_path).expect("clear should succeed");
+    assert!(!state_path.exists());
+}
+
+#[test]
+fn runtime_ownership_state_validates_pid_zero() {
+    let state = RuntimeOwnershipState {
+        pid: 0,
+        pgid: 1234,
+        started_at_unix_ms: 1000,
+        command_label: "test".to_string(),
+        profile_name: None,
+        ephemeral: true,
+    };
+
+    let err = state
+        .validate()
+        .expect_err("zero pid should fail validation");
+    assert!(err.contains("pid"));
+}
+
+#[test]
+fn runtime_ownership_state_validates_pgid_zero() {
+    let state = RuntimeOwnershipState {
+        pid: 1234,
+        pgid: 0,
+        started_at_unix_ms: 1000,
+        command_label: "test".to_string(),
+        profile_name: None,
+        ephemeral: true,
+    };
+
+    let err = state
+        .validate()
+        .expect_err("zero pgid should fail validation");
+    assert!(err.contains("pgid"));
+}
+
+#[test]
+fn runtime_ownership_state_validates_command_label_length() {
+    let state = RuntimeOwnershipState {
+        pid: 1234,
+        pgid: 1234,
+        started_at_unix_ms: 1000,
+        command_label: "x".repeat(MAX_COMMAND_LENGTH + 1),
+        profile_name: None,
+        ephemeral: true,
+    };
+
+    let err = state
+        .validate()
+        .expect_err("oversized command_label should fail validation");
+    assert!(err.contains("command_label"));
+    assert!(err.contains("maximum length"));
 }
