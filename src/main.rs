@@ -11,6 +11,7 @@ use crate::cli::{
     parse_cli_args, prepare_run_startup, should_expose_configuration, tray_tooltip,
     validate_runtime_mode,
 };
+use crate::config::reconcile_startup_runtime_state;
 use crate::desktop::{create_desktop_file_from_cli, load_tray_icon, load_window_icon_pixbuf};
 use crate::logs::{build_logs_window, setup_log_receiver, setup_logs_handlers};
 use crate::process::start_command;
@@ -244,6 +245,8 @@ fn main() {
             exit(1);
         }
     };
+
+    let startup = reconcile_startup_runtime_state(startup);
 
     gtk::init().expect("failed to initialize GTK");
     install_css();

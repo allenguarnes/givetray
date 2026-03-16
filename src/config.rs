@@ -268,3 +268,39 @@ pub(crate) fn clear_runtime_state(path: &Path) -> Result<(), String> {
     }
     Ok(())
 }
+
+pub fn reconcile_startup_runtime_state(mut startup: crate::StartupState) -> crate::StartupState {
+    let Some(runtime_path) = &startup.runtime_state_path else {
+        return startup;
+    };
+
+    let Some(runtime_ownership) = &startup.runtime_ownership else {
+        return startup;
+    };
+
+    let result = crate::process::reconcile_runtime_state(
+        runtime_ownership,
+        crate::process::is_process_group_alive,
+    );
+
+    match result {
+        crate::process::RuntimeReconcileResult::RestoreRunning => {
+            startup.restored_running = true;
+        }
+        crate::process::RuntimeReconcileResult::ClearStale => {
+            if let Err(err) = clear_runtime_state(runtime_path) {
+                eprintln!("failed to clear stale runtime state: {err}");
+            }
+            startup.runtime_state_path = None;
+            startup.runtime_ownership = None;
+            startup.restored_running = false;
+        }
+        crate::process::RuntimeReconcileResult::IgnoreInvalid => {
+            startup.runtime_state_path = None;
+            startup.runtime_ownership = None;
+            startup.restored_running = false;
+        }
+    }
+
+    startup
+}
