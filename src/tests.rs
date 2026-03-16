@@ -1265,3 +1265,22 @@ mod process_group_launch {
         assert!(result.is_err());
     }
 }
+
+mod stop_process_group {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn stop_returns_false_for_invalid_pgid() {
+        let stopped = crate::process::stop_process_group(999999, Duration::from_millis(10));
+
+        assert!(!stopped, "stop should return false for non-existent pgid");
+    }
+
+    #[test]
+    fn stop_returns_false_for_zero_pgid() {
+        let stopped = crate::process::stop_process_group(0, Duration::from_millis(10));
+
+        assert!(!stopped, "stop should return false for zero pgid");
+    }
+}

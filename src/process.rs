@@ -39,6 +39,75 @@ pub fn is_process_group_alive(pgid: i32) -> bool {
     unsafe { libc::kill(pgid, 0) == 0 }
 }
 
+pub fn stop_process_group(pgid: i32, timeout: Duration) -> bool {
+    if pgid == 0 {
+        return false;
+    }
+
+    if !is_process_group_alive(pgid) {
+        return false;
+    }
+
+    if !kill_process_group_members(pgid, libc::SIGTERM) {
+        return false;
+    }
+
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if !is_process_group_alive(pgid) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    if !is_process_group_alive(pgid) {
+        return true;
+    }
+
+    if !kill_process_group_members(pgid, libc::SIGKILL) {
+        return false;
+    }
+
+    thread::sleep(Duration::from_millis(200));
+
+    !is_process_group_alive(pgid)
+}
+
+fn kill_process_group_members(pgid: i32, signal: libc::c_int) -> bool {
+    let pids = get_process_group_pids(pgid);
+    if pids.is_empty() {
+        return unsafe { libc::kill(-pgid, signal) == 0 };
+    }
+
+    for pid in pids {
+        unsafe {
+            libc::kill(pid, signal);
+        }
+    }
+
+    true
+}
+
+fn get_process_group_pids(pgid: i32) -> Vec<libc::pid_t> {
+    let mut pids = Vec::new();
+
+    let proc_path = std::path::Path::new("/proc");
+    if let Ok(entries) = std::fs::read_dir(proc_path) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(name) = path.file_name() {
+                if let Ok(pid) = name.to_string_lossy().parse::<libc::pid_t>() {
+                    if unsafe { libc::getpgid(pid) } == pgid {
+                        pids.push(pid);
+                    }
+                }
+            }
+        }
+    }
+
+    pids
+}
+
 pub struct SpawnResult {
     pub child: Child,
     pub owned_pid: u32,
@@ -216,47 +285,48 @@ pub(crate) fn start_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>
 }
 
 pub(crate) fn stop_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>) {
+    let owned_pgid = state.borrow_mut().owned_pgid.take();
     let child = state.borrow_mut().child.take();
-    if let Some(mut child) = child {
+
+    let pgid = owned_pgid.or_else(|| child.as_ref().map(|c| c.id() as i32));
+
+    if let Some(pgid) = pgid {
         thread::spawn(move || {
-            terminate_child(&mut child, Duration::from_secs(2));
-            let code = child.wait().ok().and_then(|status| status.code());
-            let _ = ui_tx.send_blocking(UiEvent::ProcessExited(code));
+            let stopped = stop_process_group(pgid, Duration::from_secs(2));
+
+            if let Some(mut child) = child {
+                let _ = child.wait();
+            }
+
+            if stopped {
+                let _ = ui_tx.send_blocking(UiEvent::ProcessExited(None));
+            } else {
+                let _ = ui_tx.send_blocking(UiEvent::AppendLog(
+                    "failed to stop process group".to_string(),
+                ));
+                let _ = ui_tx.send_blocking(UiEvent::ProcessExited(None));
+            }
         });
     }
 }
 
 pub(crate) fn stop_command_blocking(state: Rc<RefCell<AppState>>) {
+    let owned_pgid = state.borrow_mut().owned_pgid.take();
     let child = state.borrow_mut().child.take();
-    if let Some(mut child) = child {
-        terminate_child(&mut child, Duration::from_secs(2));
-        let _ = child.wait();
-    }
-}
 
-fn terminate_child(child: &mut Child, timeout: Duration) {
-    if let Ok(Some(_)) = child.try_wait() {
-        return;
-    }
-    let pid = child.id();
-    unsafe {
-        libc::kill(pid as i32, libc::SIGTERM);
-    }
+    let pgid = owned_pgid.or_else(|| child.as_ref().map(|c| c.id() as i32));
 
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return,
-            Ok(None) => {}
-            Err(_) => break,
+    if let Some(pgid) = pgid {
+        let stopped = stop_process_group(pgid, Duration::from_secs(2));
+
+        if let Some(mut child) = child {
+            let _ = child.wait();
         }
-        if start.elapsed() > timeout {
-            break;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
 
-    let _ = child.kill();
+        if !stopped {
+            eprintln!("failed to stop process group");
+        }
+    }
 }
 
 fn spawn_reader<R: std::io::Read + Send + 'static>(reader: R, ui_tx: Sender<UiEvent>) {
