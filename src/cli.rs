@@ -1,6 +1,7 @@
 use crate::config::{
     apply_cli_overrides_to_config, config_path_for_profile, load_or_create_config,
-    resolve_log_file_path, save_config,
+    load_runtime_state, resolve_log_file_path, runtime_state_path_for_ephemeral,
+    runtime_state_path_for_profile, save_config,
 };
 use crate::{
     CliMode, CliOptions, CliRequest, CliRunTarget, Config, PersistentConfigAccess, StartupState,
@@ -158,6 +159,11 @@ pub(crate) fn build_startup_state(cli: &CliOptions) -> Result<StartupState, Stri
                 Err(err) => return Err(format!("failed to apply CLI overrides: {err}")),
             }
 
+            let runtime_state_path = runtime_state_path_for_profile(profile);
+            let runtime_ownership = runtime_state_path
+                .as_ref()
+                .and_then(|path| load_runtime_state(path));
+
             Ok(StartupState {
                 profile_label: profile.clone(),
                 persistent_config_access: persistent_config_access(
@@ -167,21 +173,28 @@ pub(crate) fn build_startup_state(cli: &CliOptions) -> Result<StartupState, Stri
                 log_file_path: resolve_log_file_path(profile, &config),
                 launch_on_startup: config.autostart,
                 config,
-                runtime_state_path: None,
-                runtime_ownership: None,
+                runtime_state_path,
+                runtime_ownership,
                 restored_running: false,
             })
         }
-        CliRunTarget::EphemeralArgv { argv } => Ok(StartupState {
-            profile_label: run_target_label(&cli.run_target),
-            persistent_config_access: None,
-            config: ephemeral_runtime_config(argv),
-            log_file_path: None,
-            launch_on_startup: true,
-            runtime_state_path: None,
-            runtime_ownership: None,
-            restored_running: false,
-        }),
+        CliRunTarget::EphemeralArgv { argv } => {
+            let runtime_state_path = runtime_state_path_for_ephemeral();
+            let runtime_ownership = runtime_state_path
+                .as_ref()
+                .and_then(|path| load_runtime_state(path));
+
+            Ok(StartupState {
+                profile_label: run_target_label(&cli.run_target),
+                persistent_config_access: None,
+                config: ephemeral_runtime_config(argv),
+                log_file_path: None,
+                launch_on_startup: true,
+                runtime_state_path,
+                runtime_ownership,
+                restored_running: false,
+            })
+        }
     }
 }
 
