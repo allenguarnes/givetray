@@ -127,6 +127,7 @@ enum UiEvent {
     AppendLog(String),
     ProcessExited(Option<i32>),
     SetRunning(bool),
+    ClearRuntimeState,
 }
 
 struct AppState {

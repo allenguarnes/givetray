@@ -187,7 +187,8 @@ pub fn persist_launch_metadata(
 }
 
 pub(crate) fn start_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>) {
-    if state.borrow().child.is_some() {
+    let has_active_process = state.borrow().child.is_some() || state.borrow().owned_pgid.is_some();
+    if has_active_process {
         let _ = ui_tx.send_blocking(UiEvent::AppendLog("command is already running".to_string()));
         return;
     }
@@ -285,46 +286,48 @@ pub(crate) fn start_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>
 }
 
 pub(crate) fn stop_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>) {
-    let owned_pgid = state.borrow_mut().owned_pgid.take();
-    let child = state.borrow_mut().child.take();
-
-    let pgid = owned_pgid.or_else(|| child.as_ref().map(|c| c.id() as i32));
+    let pgid = state.borrow().owned_pgid;
 
     if let Some(pgid) = pgid {
         thread::spawn(move || {
             let stopped = stop_process_group(pgid, Duration::from_secs(2));
 
-            if let Some(mut child) = child {
-                let _ = child.wait();
-            }
-
             if stopped {
+                let _ = ui_tx.send_blocking(UiEvent::ClearRuntimeState);
                 let _ = ui_tx.send_blocking(UiEvent::ProcessExited(None));
             } else {
                 let _ = ui_tx.send_blocking(UiEvent::AppendLog(
-                    "failed to stop process group".to_string(),
+                    "failed to stop process group, process may still be running".to_string(),
                 ));
-                let _ = ui_tx.send_blocking(UiEvent::ProcessExited(None));
             }
+        });
+    } else if state.borrow().child.is_some() {
+        let child = state.borrow_mut().child.take();
+        thread::spawn(move || {
+            if let Some(mut child) = child {
+                let _ = child.wait();
+            }
+            let _ = ui_tx.send_blocking(UiEvent::ProcessExited(None));
         });
     }
 }
 
 pub(crate) fn stop_command_blocking(state: Rc<RefCell<AppState>>) {
-    let owned_pgid = state.borrow_mut().owned_pgid.take();
-    let child = state.borrow_mut().child.take();
-
-    let pgid = owned_pgid.or_else(|| child.as_ref().map(|c| c.id() as i32));
+    let pgid = state.borrow().owned_pgid;
 
     if let Some(pgid) = pgid {
         let stopped = stop_process_group(pgid, Duration::from_secs(2));
 
-        if let Some(mut child) = child {
-            let _ = child.wait();
-        }
-
-        if !stopped {
+        if stopped {
+            state.borrow_mut().owned_pgid = None;
+            state.borrow_mut().child = None;
+        } else {
             eprintln!("failed to stop process group");
+        }
+    } else if state.borrow().child.is_some() {
+        let mut child = state.borrow_mut().child.take();
+        if let Some(child) = child.as_mut() {
+            let _ = child.wait();
         }
     }
 }

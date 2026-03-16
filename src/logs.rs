@@ -265,6 +265,10 @@ pub(crate) fn setup_log_receiver(state: Rc<RefCell<AppState>>, receiver: Receive
                         .start_stop_item
                         .set_text(if running { "Stop" } else { "Start" });
                 }
+                UiEvent::ClearRuntimeState => {
+                    state.owned_pgid = None;
+                    state.child = None;
+                }
             }
         }
     });
