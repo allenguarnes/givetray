@@ -1,10 +1,13 @@
 use crate::config::{
-    apply_cli_overrides_to_config, config_path_for_profile, load_or_create_config,
-    resolve_log_file_path, save_config,
+    apply_cli_overrides_to_config, clear_runtime_state, config_path_for_profile,
+    load_or_create_config, load_runtime_state_result, resolve_log_file_path,
+    runtime_state_path_for_ephemeral, runtime_state_path_for_profile, save_config,
+    RuntimeStateLoadResult,
 };
 use crate::{
     CliMode, CliOptions, CliRequest, CliRunTarget, Config, PersistentConfigAccess, StartupState,
     APP_NAME, BG_CHILD_ENV, MAX_COMMAND_LENGTH, MAX_PROFILE_LENGTH,
+    RUNTIME_INVALID_CLEARED_MESSAGE,
 };
 use std::env;
 use std::io;
@@ -158,6 +161,10 @@ pub(crate) fn build_startup_state(cli: &CliOptions) -> Result<StartupState, Stri
                 Err(err) => return Err(format!("failed to apply CLI overrides: {err}")),
             }
 
+            let runtime_state_path = runtime_state_path_for_profile(profile);
+            let (runtime_ownership, startup_message) =
+                load_startup_runtime_state(runtime_state_path.as_deref());
+
             Ok(StartupState {
                 profile_label: profile.clone(),
                 persistent_config_access: persistent_config_access(
@@ -167,15 +174,48 @@ pub(crate) fn build_startup_state(cli: &CliOptions) -> Result<StartupState, Stri
                 log_file_path: resolve_log_file_path(profile, &config),
                 launch_on_startup: config.autostart,
                 config,
+                runtime_state_path,
+                runtime_ownership,
+                restored_running: false,
+                startup_message,
             })
         }
-        CliRunTarget::EphemeralArgv { argv } => Ok(StartupState {
-            profile_label: run_target_label(&cli.run_target),
-            persistent_config_access: None,
-            config: ephemeral_runtime_config(argv),
-            log_file_path: None,
-            launch_on_startup: true,
-        }),
+        CliRunTarget::EphemeralArgv { argv } => {
+            let runtime_state_path = runtime_state_path_for_ephemeral();
+            let (runtime_ownership, startup_message) =
+                load_startup_runtime_state(runtime_state_path.as_deref());
+
+            Ok(StartupState {
+                profile_label: run_target_label(&cli.run_target),
+                persistent_config_access: None,
+                config: ephemeral_runtime_config(argv),
+                log_file_path: None,
+                launch_on_startup: true,
+                runtime_state_path,
+                runtime_ownership,
+                restored_running: false,
+                startup_message,
+            })
+        }
+    }
+}
+
+fn load_startup_runtime_state(
+    runtime_state_path: Option<&Path>,
+) -> (Option<crate::RuntimeOwnershipState>, Option<String>) {
+    let Some(path) = runtime_state_path else {
+        return (None, None);
+    };
+
+    match load_runtime_state_result(path) {
+        RuntimeStateLoadResult::Loaded(state) => (Some(state), None),
+        RuntimeStateLoadResult::Missing => (None, None),
+        RuntimeStateLoadResult::Invalid => {
+            if let Err(err) = clear_runtime_state(path) {
+                eprintln!("failed to clear invalid runtime state: {err}");
+            }
+            (None, Some(RUNTIME_INVALID_CLEARED_MESSAGE.to_string()))
+        }
     }
 }
 

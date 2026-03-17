@@ -1,6 +1,6 @@
 use crate::{
-    AppState, LogLink, PendingLogLink, UiEvent, LOG_LINK_CLICK_SLOP, LOG_LINK_TAG_NAME,
-    MAX_LOG_LINES,
+    config::clear_runtime_state, AppState, LogLink, PendingLogLink, UiEvent, LOG_LINK_CLICK_SLOP,
+    LOG_LINK_TAG_NAME, MAX_LOG_LINES,
 };
 use async_channel::Receiver;
 use glib::{MainContext, Propagation};
@@ -10,6 +10,14 @@ use std::fs::{self, File};
 use std::io::{LineWriter, Write};
 use std::path::Path;
 use std::{cell::RefCell, rc::Rc};
+
+pub(crate) fn clear_runtime_state_after_exit(runtime_state_path: Option<&Path>) {
+    if let Some(path) = runtime_state_path {
+        if let Err(err) = clear_runtime_state(path) {
+            eprintln!("failed to clear runtime state after exit: {err}");
+        }
+    }
+}
 
 pub(crate) fn build_logs_window() -> (
     gtk::Window,
@@ -252,8 +260,20 @@ pub(crate) fn setup_log_receiver(state: Rc<RefCell<AppState>>, receiver: Receive
             match event {
                 UiEvent::AppendLog(line) => append_log(&mut state, line),
                 UiEvent::ProcessExited(code) => {
+                    if state.process_exit_reported {
+                        continue;
+                    }
+                    let owned_was_cleared = state.owned_pgid.is_none() && state.child.is_none();
+                    
+                    if owned_was_cleared {
+                        clear_runtime_state_after_exit(state.runtime_state_path.as_deref());
+                        state.restored_running = false;
+                        state.start_stop_item.set_text("Start");
+                    }
+                    
                     state.child = None;
-                    state.start_stop_item.set_text("Start");
+                    state.process_exit_reported = true;
+                    
                     let msg = match code {
                         Some(code) => format!("command exited with code {code}"),
                         None => "command exited".to_string(),
@@ -264,6 +284,18 @@ pub(crate) fn setup_log_receiver(state: Rc<RefCell<AppState>>, receiver: Receive
                     state
                         .start_stop_item
                         .set_text(if running { "Stop" } else { "Start" });
+                }
+                UiEvent::ClearRuntimeState => {
+                    let owned_was_cleared = state.owned_pgid.is_none() && state.child.is_none();
+                    
+                    if owned_was_cleared {
+                        clear_runtime_state_after_exit(state.runtime_state_path.as_deref());
+                        state.restored_running = false;
+                    }
+                    
+                    state.child = None;
+                    state.owned_pgid = None;
+                    state.owned_pid = None;
                 }
             }
         }

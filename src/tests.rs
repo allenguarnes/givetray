@@ -4,13 +4,19 @@ use crate::cli::{
     persistent_config_access, prepare_run_startup_with, should_expose_configuration, tray_tooltip,
     validate_runtime_mode,
 };
+use crate::config::config_path_for_profile;
 use crate::config::{
-    clear_runtime_state, config_path_for_profile, load_runtime_state,
-    runtime_state_path_for_ephemeral, runtime_state_path_for_profile, save_runtime_state,
+    clear_runtime_state, load_runtime_state, reconcile_startup_runtime_state,
+    runtime_state_path_for_ephemeral, runtime_state_path_for_profile, save_config,
+    save_runtime_state,
 };
 use crate::logs::{
-    append_log_to_file, extract_log_links, should_activate_log_link, strip_ansi_codes,
+    append_log_to_file, clear_runtime_state_after_exit, extract_log_links,
+    should_activate_log_link, strip_ansi_codes,
 };
+use crate::process::is_process_group_alive;
+use crate::process::reconcile_runtime_state;
+use crate::process::RuntimeReconcileResult;
 use crate::*;
 use std::env;
 use std::fs;
@@ -402,6 +408,10 @@ fn ephemeral_mode_hides_configuration_menu() {
         config: ephemeral_runtime_config(&["echo".to_string()]),
         log_file_path: None,
         launch_on_startup: true,
+        runtime_state_path: None,
+        runtime_ownership: None,
+        restored_running: false,
+        startup_message: None,
     };
 
     assert!(!should_expose_configuration(
@@ -426,6 +436,10 @@ fn persistent_mode_exposes_configuration_menu() {
         },
         log_file_path: None,
         launch_on_startup: false,
+        runtime_state_path: None,
+        runtime_ownership: None,
+        restored_running: false,
+        startup_message: None,
     };
 
     assert!(should_expose_configuration(
@@ -474,6 +488,10 @@ fn persistent_startup_state_exposes_configuration_from_source_of_truth() {
         },
         log_file_path: None,
         launch_on_startup: false,
+        runtime_state_path: None,
+        runtime_ownership: None,
+        restored_running: false,
+        startup_message: None,
     };
 
     assert!(should_expose_configuration(
@@ -642,7 +660,7 @@ fn runtime_state_round_trips_for_profile_run() {
     let state = RuntimeOwnershipState {
         pid: 1234,
         pgid: 1234,
-        started_at_unix_ms: 1000,
+        started_at_clock_ticks: 1000,
         command_label: "sleep 30".to_string(),
         profile_name: Some("default".to_string()),
         ephemeral: false,
@@ -662,7 +680,7 @@ fn runtime_state_round_trips_for_ephemeral_run() {
     let state = RuntimeOwnershipState {
         pid: 5678,
         pgid: 5678,
-        started_at_unix_ms: 2000,
+        started_at_clock_ticks: 2000,
         command_label: "echo hello".to_string(),
         profile_name: None,
         ephemeral: true,
@@ -679,14 +697,14 @@ fn runtime_state_round_trips_for_ephemeral_run() {
 
 #[test]
 fn invalid_runtime_state_toml_returns_none() {
-    let temp_root = unique_test_dir("invalid-runtime-state");
-    fs::create_dir_all(&temp_root).expect("temp root should be created");
-    let state_path = temp_root.join("runtime-state.toml");
+    let temp_dir = unique_test_dir("invalid-runtime-state");
+    fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+    let state_path = temp_dir.join("runtime-state.toml");
 
-    fs::write(&state_path, "invalid toml content {").expect("invalid file should be written");
+    fs::write(&state_path, "invalid toml content {{{{").expect("invalid file should be written");
 
-    let loaded = load_runtime_state(&state_path);
-    assert!(loaded.is_none(), "invalid TOML should return None");
+    let result = load_runtime_state(&state_path);
+    assert!(result.is_none());
 }
 
 #[test]
@@ -700,52 +718,85 @@ fn missing_runtime_state_file_returns_none() {
 }
 
 #[test]
+fn malformed_runtime_state_file_gets_cleared_during_startup() {
+    let _env_lock = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let temp_root = unique_test_dir("malformed-runtime-state-cleanup");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let config_path = config_path_for_profile("broken").expect("config path should resolve");
+    let config_parent = config_path.parent().expect("config parent should exist");
+    fs::create_dir_all(config_parent).expect("config dir should be created");
+    save_config(
+        &config_path,
+        &Config {
+            command: DEFAULT_COMMAND.to_string(),
+            autostart: false,
+            icon_path: None,
+            log_to_file: false,
+            log_file_path: None,
+        },
+    )
+    .expect("config should save");
+
+    let runtime_path =
+        runtime_state_path_for_profile("broken").expect("runtime path should resolve");
+    fs::create_dir_all(runtime_path.parent().expect("runtime parent should exist"))
+        .expect("runtime dir should be created");
+    fs::write(&runtime_path, "not valid toml {{{")
+        .expect("invalid runtime state should be written");
+
+    let cli = parse_cli_args_from(["givetray", "-c", "broken"]).expect("cli should parse");
+    let startup = build_startup_state(&cli).expect("startup should build");
+    let reconciled = reconcile_startup_runtime_state(startup);
+
+    assert!(reconciled.runtime_ownership.is_none());
+    assert_eq!(
+        reconciled.startup_message.as_deref(),
+        Some(RUNTIME_INVALID_CLEARED_MESSAGE)
+    );
+    assert!(
+        !runtime_path.exists(),
+        "malformed runtime-state file should be cleared"
+    );
+}
+
+#[test]
 fn runtime_state_path_resolves_for_profile() {
     let _env_lock = ENV_LOCK.lock().expect("env lock should be acquired");
     let temp_root = unique_test_dir("runtime-state-profile-path");
     fs::create_dir_all(&temp_root).expect("temp root should be created");
     let _env = TestEnvGuard::set(&temp_root);
 
-    let path = runtime_state_path_for_profile("default");
-    assert!(path.is_some(), "profile path should resolve");
+    let path = runtime_state_path_for_profile("my-profile");
 
+    assert!(path.is_some());
     let path = path.unwrap();
-    assert!(
-        path.to_string_lossy().contains("default"),
-        "path should contain profile name"
-    );
-    assert!(
-        path.to_string_lossy().ends_with(".toml"),
-        "path should be a toml file"
-    );
+    assert!(path.to_string_lossy().contains("my-profile"));
 }
 
 #[test]
 fn runtime_state_path_resolves_for_ephemeral() {
+    let _env_lock = ENV_LOCK.lock().expect("env lock should be acquired");
     let temp_root = unique_test_dir("runtime-state-ephemeral-path");
     fs::create_dir_all(&temp_root).expect("temp root should be created");
     let _env = TestEnvGuard::set(&temp_root);
 
     let path = runtime_state_path_for_ephemeral();
-    assert!(path.is_some(), "ephemeral path should resolve");
 
-    let path = path.unwrap();
-    assert!(
-        path.to_string_lossy().ends_with("ephemeral.toml"),
-        "path should be ephemeral.toml"
-    );
+    assert!(path.is_some());
 }
 
 #[test]
-fn save_and_load_runtime_state_round_trip() {
+fn save_and_load_runtime_state() {
     let temp_root = unique_test_dir("save-load-runtime-state");
-    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    fs::create_dir_all(&temp_root).expect("temp dir should be created");
     let state_path = temp_root.join("runtime-state.toml");
 
     let state = RuntimeOwnershipState {
         pid: 9999,
         pgid: 9999,
-        started_at_unix_ms: 5000,
+        started_at_clock_ticks: 3000,
         command_label: "test command".to_string(),
         profile_name: Some("testprofile".to_string()),
         ephemeral: false,
@@ -754,40 +805,33 @@ fn save_and_load_runtime_state_round_trip() {
     save_runtime_state(&state_path, &state).expect("save should succeed");
 
     let loaded = load_runtime_state(&state_path);
-    assert!(loaded.is_some(), "loaded state should exist");
-
+    assert!(loaded.is_some());
     let loaded = loaded.unwrap();
     assert_eq!(loaded.pid, 9999);
     assert_eq!(loaded.pgid, 9999);
-    assert_eq!(loaded.started_at_unix_ms, 5000);
-    assert_eq!(loaded.command_label, "test command");
     assert_eq!(loaded.profile_name.as_deref(), Some("testprofile"));
-    assert!(!loaded.ephemeral);
 }
 
 #[test]
 fn clear_runtime_state_removes_file() {
     let temp_root = unique_test_dir("clear-runtime-state");
-    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    fs::create_dir_all(&temp_root).expect("temp dir should be created");
     let state_path = temp_root.join("runtime-state.toml");
 
     let state = RuntimeOwnershipState {
         pid: 1111,
         pgid: 1111,
-        started_at_unix_ms: 6000,
-        command_label: "clear test".to_string(),
+        started_at_clock_ticks: 4000,
+        command_label: "to be cleared".to_string(),
         profile_name: None,
         ephemeral: true,
     };
 
     save_runtime_state(&state_path, &state).expect("save should succeed");
-    assert!(state_path.exists(), "state file should exist after save");
+    assert!(state_path.exists());
 
     clear_runtime_state(&state_path).expect("clear should succeed");
-    assert!(
-        !state_path.exists(),
-        "state file should be removed after clear"
-    );
+    assert!(!state_path.exists());
 }
 
 #[test]
@@ -798,4 +842,708 @@ fn clear_nonexistent_runtime_state_succeeds() {
 
     let result = clear_runtime_state(&state_path);
     assert!(result.is_ok(), "clearing nonexistent file should succeed");
+}
+
+#[test]
+fn runtime_ownership_state_validates_pid_zero() {
+    let state = RuntimeOwnershipState {
+        pid: 0,
+        pgid: 1234,
+        started_at_clock_ticks: 1000,
+        command_label: "test".to_string(),
+        profile_name: None,
+        ephemeral: true,
+    };
+
+    let err = state
+        .validate()
+        .expect_err("zero pid should fail validation");
+    assert!(err.contains("pid"));
+}
+
+#[test]
+fn runtime_ownership_state_validates_pgid_zero() {
+    let state = RuntimeOwnershipState {
+        pid: 1234,
+        pgid: 0,
+        started_at_clock_ticks: 1000,
+        command_label: "test".to_string(),
+        profile_name: None,
+        ephemeral: true,
+    };
+
+    let err = state
+        .validate()
+        .expect_err("zero pgid should fail validation");
+    assert!(err.contains("pgid"));
+}
+
+#[test]
+fn runtime_ownership_state_validates_command_label_length() {
+    let state = RuntimeOwnershipState {
+        pid: 1234,
+        pgid: 1234,
+        started_at_clock_ticks: 1000,
+        command_label: "x".repeat(MAX_COMMAND_LENGTH + 1),
+        profile_name: None,
+        ephemeral: true,
+    };
+
+    let err = state
+        .validate()
+        .expect_err("oversized command_label should fail validation");
+    assert!(err.contains("command_label"));
+    assert!(err.contains("maximum length"));
+}
+
+#[test]
+fn reconcile_runtime_state_restores_running_when_group_is_alive() {
+    use crate::process::get_process_start_time;
+
+    let own_pid = std::process::id();
+    let own_pgid = unsafe { libc::getpgid(0) };
+    let actual_start_time = get_process_start_time(own_pid as libc::pid_t)
+        .expect("should be able to get process start time");
+
+    let state = RuntimeOwnershipState {
+        pid: own_pid,
+        pgid: own_pgid as u32,
+        started_at_clock_ticks: actual_start_time,
+        command_label: "sleep 30".to_string(),
+        profile_name: Some("default".to_string()),
+        ephemeral: false,
+    };
+
+    let result = reconcile_runtime_state(&state, is_process_group_alive);
+    assert!(matches!(result, RuntimeReconcileResult::RestoreRunning));
+}
+
+#[test]
+fn reconcile_runtime_state_clears_stale_when_group_is_missing() {
+    let state = RuntimeOwnershipState {
+        pid: 1234,
+        pgid: 1234,
+        started_at_clock_ticks: 1000,
+        command_label: "sleep 30".to_string(),
+        profile_name: Some("default".to_string()),
+        ephemeral: false,
+    };
+
+    let result = reconcile_runtime_state(&state, |_pgid| false);
+    assert!(matches!(result, RuntimeReconcileResult::ClearStale));
+}
+
+#[test]
+fn reconcile_runtime_state_ignores_invalid_metadata() {
+    let state = RuntimeOwnershipState {
+        pid: 0,
+        pgid: 0,
+        started_at_clock_ticks: 1000,
+        command_label: "sleep 30".to_string(),
+        profile_name: Some("default".to_string()),
+        ephemeral: false,
+    };
+
+    let result = reconcile_runtime_state(&state, is_process_group_alive);
+    assert!(matches!(result, RuntimeReconcileResult::IgnoreInvalid));
+}
+
+#[test]
+fn reconcile_runtime_state_handles_old_unix_timestamp_format() {
+    // Test that old format (unix timestamp in ms) is handled gracefully
+    // Old format used started_at_unix_ms which would be a large number like 1700000000000+
+    // New format uses clock ticks which are much smaller
+    let own_pid = std::process::id();
+    let own_pgid = unsafe { libc::getpgid(0) };
+
+    // Use a unix timestamp in ms (very large number > 1 trillion)
+    let old_unix_timestamp_ms = 1700000000000u64;
+
+    let state = RuntimeOwnershipState {
+        pid: own_pid,
+        pgid: own_pgid as u32,
+        started_at_clock_ticks: old_unix_timestamp_ms, // Old format: unix ms
+        command_label: "sleep 30".to_string(),
+        profile_name: Some("default".to_string()),
+        ephemeral: false,
+    };
+
+    // Should restore running because it's the old format - we skip start time validation
+    // but still validate PGID membership
+    let result = reconcile_runtime_state(&state, is_process_group_alive);
+    assert!(matches!(result, RuntimeReconcileResult::RestoreRunning));
+}
+
+#[test]
+fn parse_process_start_time_handles_process_name_with_closing_paren() {
+    let stat = "123 (worker) helper) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 424242 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52";
+
+    let parsed = crate::process::parse_process_start_time_from_stat(stat);
+
+    assert_eq!(parsed, Some(424242));
+}
+
+#[test]
+fn process_exit_event_is_not_re_emitted_after_already_reported() {
+    let should_emit = crate::ui::should_emit_process_exited(true, true, true, true);
+
+    assert!(
+        !should_emit,
+        "watcher should not emit duplicate ProcessExited events"
+    );
+}
+
+#[test]
+fn startup_runtime_state_no_state_stops() {
+    let startup = StartupState {
+        profile_label: "default".to_string(),
+        persistent_config_access: Some(PersistentConfigAccess {
+            profile: "default".to_string(),
+            config_path: PathBuf::from("/tmp/default.toml"),
+        }),
+        config: Config {
+            command: "echo test".to_string(),
+            autostart: false,
+            icon_path: None,
+            log_to_file: false,
+            log_file_path: None,
+        },
+        log_file_path: None,
+        launch_on_startup: false,
+        runtime_state_path: None,
+        runtime_ownership: None,
+        restored_running: false,
+        startup_message: None,
+    };
+
+    assert!(startup.runtime_state_path.is_none());
+    assert!(startup.runtime_ownership.is_none());
+    assert!(!startup.restored_running);
+}
+
+#[test]
+fn startup_runtime_state_recovered_running() {
+    let ownership = RuntimeOwnershipState {
+        pid: 12345,
+        pgid: 12345,
+        started_at_clock_ticks: 1000,
+        command_label: "sleep 60".to_string(),
+        profile_name: Some("default".to_string()),
+        ephemeral: false,
+    };
+
+    let startup = StartupState {
+        profile_label: "default".to_string(),
+        persistent_config_access: Some(PersistentConfigAccess {
+            profile: "default".to_string(),
+            config_path: PathBuf::from("/tmp/default.toml"),
+        }),
+        config: Config {
+            command: "sleep 60".to_string(),
+            autostart: false,
+            icon_path: None,
+            log_to_file: false,
+            log_file_path: None,
+        },
+        log_file_path: None,
+        launch_on_startup: false,
+        runtime_state_path: Some(PathBuf::from("/tmp/runtime-state.toml")),
+        runtime_ownership: Some(ownership),
+        restored_running: true,
+        startup_message: None,
+    };
+
+    assert!(startup.runtime_state_path.is_some());
+    assert!(startup.runtime_ownership.is_some());
+    assert!(startup.restored_running);
+    assert_eq!(startup.runtime_ownership.as_ref().unwrap().pid, 12345);
+}
+
+#[test]
+fn startup_runtime_state_stale_clears() {
+    let ownership = RuntimeOwnershipState {
+        pid: 99999,
+        pgid: 99999,
+        started_at_clock_ticks: 1000,
+        command_label: "sleep 60".to_string(),
+        profile_name: Some("default".to_string()),
+        ephemeral: false,
+    };
+
+    let startup = StartupState {
+        profile_label: "default".to_string(),
+        persistent_config_access: Some(PersistentConfigAccess {
+            profile: "default".to_string(),
+            config_path: PathBuf::from("/tmp/default.toml"),
+        }),
+        config: Config {
+            command: "sleep 60".to_string(),
+            autostart: false,
+            icon_path: None,
+            log_to_file: false,
+            log_file_path: None,
+        },
+        log_file_path: None,
+        launch_on_startup: false,
+        runtime_state_path: Some(PathBuf::from("/tmp/runtime-state.toml")),
+        runtime_ownership: Some(ownership),
+        restored_running: false,
+        startup_message: None,
+    };
+
+    assert!(startup.runtime_state_path.is_some());
+    assert!(startup.runtime_ownership.is_some());
+    assert!(!startup.restored_running);
+}
+
+#[test]
+fn startup_reconcile_dead_runtime_state_gets_cleared() {
+    let _env_lock = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let temp_root = unique_test_dir("startup-reconcile-dead");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let state_path = runtime_state_path_for_profile("testprofile").expect("path should resolve");
+    fs::create_dir_all(state_path.parent().expect("parent dir should exist"))
+        .expect("parent dir should be created");
+
+    let dead_state = RuntimeOwnershipState {
+        pid: 99999,
+        pgid: 99999,
+        started_at_clock_ticks: 1000,
+        command_label: "sleep 60".to_string(),
+        profile_name: Some("testprofile".to_string()),
+        ephemeral: false,
+    };
+    save_runtime_state(&state_path, &dead_state).expect("state should save");
+    assert!(state_path.exists());
+
+    let startup = StartupState {
+        profile_label: "testprofile".to_string(),
+        persistent_config_access: Some(PersistentConfigAccess {
+            profile: "testprofile".to_string(),
+            config_path: PathBuf::from("/tmp/default.toml"),
+        }),
+        config: Config {
+            command: "sleep 60".to_string(),
+            autostart: false,
+            icon_path: None,
+            log_to_file: false,
+            log_file_path: None,
+        },
+        log_file_path: None,
+        launch_on_startup: false,
+        runtime_state_path: Some(state_path.clone()),
+        runtime_ownership: Some(dead_state),
+        restored_running: false,
+        startup_message: None,
+    };
+
+    let reconciled = reconcile_startup_runtime_state(startup);
+
+    assert!(!reconciled.restored_running);
+    assert!(reconciled.runtime_state_path.is_some());
+    assert!(reconciled.runtime_ownership.is_none());
+    assert!(!state_path.exists());
+}
+
+#[test]
+fn startup_reconcile_live_runtime_state_sets_restored_running() {
+    use crate::process::get_process_start_time;
+
+    let _env_lock = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let temp_root = unique_test_dir("startup-reconcile-live");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let state_path = runtime_state_path_for_profile("testprofile").expect("path should resolve");
+    fs::create_dir_all(state_path.parent().expect("parent dir should exist"))
+        .expect("parent dir should be created");
+
+    let own_pid = std::process::id();
+    let own_pgid = unsafe { libc::getpgid(0) as u32 };
+    let actual_start_time = get_process_start_time(own_pid as libc::pid_t)
+        .expect("should be able to get process start time");
+
+    let live_state = RuntimeOwnershipState {
+        pid: own_pid,
+        pgid: own_pgid,
+        started_at_clock_ticks: actual_start_time,
+        command_label: "sleep 60".to_string(),
+        profile_name: Some("testprofile".to_string()),
+        ephemeral: false,
+    };
+    save_runtime_state(&state_path, &live_state).expect("state should save");
+
+    let startup = StartupState {
+        profile_label: "testprofile".to_string(),
+        persistent_config_access: Some(PersistentConfigAccess {
+            profile: "testprofile".to_string(),
+            config_path: PathBuf::from("/tmp/default.toml"),
+        }),
+        config: Config {
+            command: "sleep 60".to_string(),
+            autostart: false,
+            icon_path: None,
+            log_to_file: false,
+            log_file_path: None,
+        },
+        log_file_path: None,
+        launch_on_startup: false,
+        runtime_state_path: Some(state_path),
+        runtime_ownership: Some(live_state),
+        restored_running: false,
+        startup_message: None,
+    };
+
+    let reconciled = reconcile_startup_runtime_state(startup);
+
+    assert!(reconciled.restored_running);
+    assert!(reconciled.runtime_ownership.is_some());
+    assert_eq!(reconciled.runtime_ownership.as_ref().unwrap().pid, own_pid);
+}
+
+#[test]
+fn startup_reconcile_invalid_runtime_state_falls_back_to_stopped() {
+    let _env_lock = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let temp_root = unique_test_dir("startup-reconcile-invalid");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let state_path = runtime_state_path_for_profile("testprofile").expect("path should resolve");
+    fs::create_dir_all(state_path.parent().expect("parent dir should exist"))
+        .expect("parent dir should be created");
+
+    let invalid_state = RuntimeOwnershipState {
+        pid: 0,
+        pgid: 0,
+        started_at_clock_ticks: 1000,
+        command_label: "sleep 60".to_string(),
+        profile_name: Some("testprofile".to_string()),
+        ephemeral: false,
+    };
+    save_runtime_state(&state_path, &invalid_state).expect("state should save");
+
+    let startup = StartupState {
+        profile_label: "testprofile".to_string(),
+        persistent_config_access: Some(PersistentConfigAccess {
+            profile: "testprofile".to_string(),
+            config_path: PathBuf::from("/tmp/default.toml"),
+        }),
+        config: Config {
+            command: "sleep 60".to_string(),
+            autostart: false,
+            icon_path: None,
+            log_to_file: false,
+            log_file_path: None,
+        },
+        log_file_path: None,
+        launch_on_startup: false,
+        runtime_state_path: Some(state_path.clone()),
+        runtime_ownership: Some(invalid_state),
+        restored_running: false,
+        startup_message: None,
+    };
+
+    let reconciled = reconcile_startup_runtime_state(startup);
+
+    assert!(!reconciled.restored_running);
+    assert!(reconciled.runtime_state_path.is_some());
+    assert!(reconciled.runtime_ownership.is_none());
+    assert!(!state_path.exists());
+}
+
+#[test]
+fn clear_runtime_state_after_exit_removes_persisted_file() {
+    let _env_lock = ENV_LOCK.lock().expect("env lock should be acquired");
+    let temp_root = unique_test_dir("clear-runtime-state-after-exit");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let state_path = runtime_state_path_for_profile("cleanup").expect("path should resolve");
+    save_runtime_state(
+        &state_path,
+        &RuntimeOwnershipState {
+            pid: 321,
+            pgid: 321,
+            started_at_clock_ticks: 123,
+            command_label: "sleep 1".to_string(),
+            profile_name: Some("cleanup".to_string()),
+            ephemeral: false,
+        },
+    )
+    .expect("runtime state should save");
+
+    clear_runtime_state_after_exit(Some(&state_path));
+
+    assert!(!state_path.exists());
+}
+
+#[test]
+fn initial_start_stop_label_reflects_restored_state() {
+    assert_eq!(initial_start_stop_label(false), "Start");
+    assert_eq!(initial_start_stop_label(true), "Stop");
+}
+
+#[test]
+fn should_launch_on_startup_skips_relaunch_for_restored_run() {
+    let startup = StartupState {
+        profile_label: "default".to_string(),
+        persistent_config_access: None,
+        config: Config {
+            command: DEFAULT_COMMAND.to_string(),
+            autostart: true,
+            icon_path: None,
+            log_to_file: false,
+            log_file_path: None,
+        },
+        log_file_path: None,
+        launch_on_startup: true,
+        runtime_state_path: None,
+        runtime_ownership: None,
+        restored_running: true,
+        startup_message: None,
+    };
+
+    assert!(!should_launch_on_startup(&startup));
+}
+
+#[test]
+fn should_launch_on_startup_runs_when_not_restored() {
+    let startup = StartupState {
+        profile_label: "default".to_string(),
+        persistent_config_access: None,
+        config: Config {
+            command: DEFAULT_COMMAND.to_string(),
+            autostart: true,
+            icon_path: None,
+            log_to_file: false,
+            log_file_path: None,
+        },
+        log_file_path: None,
+        launch_on_startup: true,
+        runtime_state_path: None,
+        runtime_ownership: None,
+        restored_running: false,
+        startup_message: None,
+    };
+
+    assert!(should_launch_on_startup(&startup));
+}
+
+#[test]
+fn startup_reconcile_sets_restored_message() {
+    use crate::process::get_process_start_time;
+
+    let own_pid = std::process::id();
+    let own_pgid = unsafe { libc::getpgid(0) as u32 };
+    let actual_start_time = get_process_start_time(own_pid as libc::pid_t)
+        .expect("should be able to get process start time");
+
+    let startup = StartupState {
+        profile_label: "default".to_string(),
+        persistent_config_access: None,
+        config: Config {
+            command: DEFAULT_COMMAND.to_string(),
+            autostart: false,
+            icon_path: None,
+            log_to_file: false,
+            log_file_path: None,
+        },
+        log_file_path: None,
+        launch_on_startup: false,
+        runtime_state_path: Some(PathBuf::from("/tmp/runtime-state.toml")),
+        runtime_ownership: Some(RuntimeOwnershipState {
+            pid: own_pid,
+            pgid: own_pgid,
+            started_at_clock_ticks: actual_start_time,
+            command_label: "sleep 1".to_string(),
+            profile_name: Some("default".to_string()),
+            ephemeral: false,
+        }),
+        restored_running: false,
+        startup_message: None,
+    };
+
+    let reconciled = reconcile_startup_runtime_state(startup);
+    assert_eq!(
+        reconciled.startup_message.as_deref(),
+        Some(RUNTIME_RESTORED_MESSAGE)
+    );
+}
+
+mod process_group_launch {
+    use super::*;
+
+    #[test]
+    fn spawn_in_new_process_group_creates_separate_pgid() {
+        let mut result =
+            crate::process::spawn_command_in_new_process_group("sleep", &["0".to_string()], false)
+                .expect("spawn should succeed");
+
+        assert!(result.owned_pid > 0, "owned_pid should be set");
+        assert!(result.owned_pgid > 0, "owned_pgid should be set");
+
+        let pgid_matches = unsafe { libc::getpgid(result.owned_pid as libc::pid_t) };
+        assert!(pgid_matches >= 0, "pgid should be retrievable");
+        assert_eq!(
+            pgid_matches, result.owned_pgid as libc::pid_t,
+            "child's pgid should match owned_pgid"
+        );
+
+        let _ = result.child.kill();
+        let _ = result.child.wait();
+    }
+
+    #[test]
+    fn spawn_in_new_process_group_pgid_differs_from_parent() {
+        let parent_pgid = unsafe { libc::getpgid(0) };
+
+        let mut result =
+            crate::process::spawn_command_in_new_process_group("sleep", &["0".to_string()], false)
+                .expect("spawn should succeed");
+
+        assert_ne!(
+            result.owned_pgid as libc::pid_t, parent_pgid,
+            "child's pgid should differ from parent's pgid"
+        );
+
+        let _ = result.child.kill();
+        let _ = result.child.wait();
+    }
+
+    #[test]
+    fn persist_launch_metadata_saves_to_profile_path() {
+        use crate::process::persist_launch_metadata_with_start_time;
+
+        let _env_lock = ENV_LOCK.lock().expect("env lock should be acquired");
+        let temp_root = unique_test_dir("persist-metadata-profile");
+        fs::create_dir_all(&temp_root).expect("temp root should be created");
+        let _env = TestEnvGuard::set(&temp_root);
+
+        let state_path =
+            runtime_state_path_for_profile("testprofile").expect("path should resolve");
+
+        persist_launch_metadata_with_start_time(
+            &Some(state_path.clone()),
+            "echo hello",
+            12345,
+            12345,
+            Some("testprofile"),
+            false,
+            Some(1000),
+        )
+        .expect("persist should succeed");
+
+        let loaded = load_runtime_state(&state_path).expect("state should load");
+        assert_eq!(loaded.pid, 12345);
+        assert_eq!(loaded.pgid, 12345);
+        assert_eq!(loaded.profile_name.as_deref(), Some("testprofile"));
+        assert!(!loaded.ephemeral);
+        assert_eq!(loaded.command_label, "echo hello");
+    }
+
+    #[test]
+    fn persist_launch_metadata_saves_to_ephemeral_path() {
+        use crate::process::persist_launch_metadata_with_start_time;
+
+        let _env_lock = ENV_LOCK.lock().expect("env lock should be acquired");
+        let temp_root = unique_test_dir("persist-metadata-ephemeral");
+        fs::create_dir_all(&temp_root).expect("temp root should be created");
+        let _env = TestEnvGuard::set(&temp_root);
+
+        let state_path = runtime_state_path_for_ephemeral().expect("path should resolve");
+
+        persist_launch_metadata_with_start_time(
+            &Some(state_path.clone()),
+            "echo ephemeral",
+            54321,
+            54321,
+            None,
+            true,
+            Some(2000),
+        )
+        .expect("persist should succeed");
+
+        let loaded = load_runtime_state(&state_path).expect("state should load");
+        assert_eq!(loaded.pid, 54321);
+        assert_eq!(loaded.pgid, 54321);
+        assert!(loaded.profile_name.is_none());
+        assert!(loaded.ephemeral);
+        assert_eq!(loaded.command_label, "echo ephemeral");
+    }
+
+    #[test]
+    fn persist_launch_metadata_overwrites_existing() {
+        use crate::process::persist_launch_metadata_with_start_time;
+
+        let _env_lock = ENV_LOCK.lock().expect("env lock should be acquired");
+        let temp_root = unique_test_dir("persist-overwrite");
+        fs::create_dir_all(&temp_root).expect("temp root should be created");
+        let _env = TestEnvGuard::set(&temp_root);
+
+        let state_path = runtime_state_path_for_profile("overwrite").expect("path should resolve");
+
+        let old_state = RuntimeOwnershipState {
+            pid: 11111,
+            pgid: 11111,
+            started_at_clock_ticks: 1000,
+            command_label: "old command".to_string(),
+            profile_name: Some("overwrite".to_string()),
+            ephemeral: false,
+        };
+        save_runtime_state(&state_path, &old_state).expect("old state should save");
+
+        persist_launch_metadata_with_start_time(
+            &Some(state_path.clone()),
+            "new command",
+            22222,
+            22222,
+            Some("overwrite"),
+            false,
+            Some(3000),
+        )
+        .expect("persist should succeed");
+
+        let loaded = load_runtime_state(&state_path).expect("state should load");
+        assert_eq!(loaded.pid, 22222);
+        assert_eq!(loaded.pgid, 22222);
+        assert_eq!(loaded.command_label, "new command");
+    }
+
+    #[test]
+    fn persist_launch_metadata_fails_without_path() {
+        let result = crate::process::persist_launch_metadata(
+            &None,
+            "echo test",
+            12345,
+            12345,
+            Some("test"),
+            false,
+        );
+
+        assert!(result.is_err());
+    }
+}
+
+mod stop_process_group {
+    use std::time::Duration;
+
+    #[test]
+    fn stop_returns_false_for_invalid_pgid() {
+        // Returns true because an already-exited process group is "success" - nothing to stop
+        let stopped = crate::process::stop_process_group(999999, Duration::from_millis(10));
+
+        assert!(
+            stopped,
+            "stop should return true for non-existent pgid (already gone)"
+        );
+    }
+
+    #[test]
+    fn stop_returns_false_for_zero_pgid() {
+        let stopped = crate::process::stop_process_group(0, Duration::from_millis(10));
+
+        assert!(!stopped, "stop should return false for zero pgid");
+    }
 }

@@ -1,7 +1,9 @@
 use crate::desktop::copy_icon_to_profile;
 use crate::logs::append_log;
 use crate::{
-    AppState, CliOptions, Config, RuntimeOwnershipState, APP_NAME, DEFAULT_COMMAND, DEFAULT_PROFILE,
+    AppState, CliOptions, Config, RuntimeOwnershipState, APP_NAME, DEFAULT_COMMAND,
+    DEFAULT_PROFILE, RUNTIME_INVALID_CLEARED_MESSAGE, RUNTIME_RESTORED_MESSAGE,
+    RUNTIME_STALE_CLEARED_MESSAGE,
 };
 use directories::ProjectDirs;
 use gtk::prelude::*;
@@ -99,49 +101,6 @@ pub(crate) fn sanitize_profile_name(profile: &str) -> String {
         cleaned = DEFAULT_PROFILE.to_string();
     }
     cleaned
-}
-
-pub(crate) fn runtime_state_path_for_profile(profile: &str) -> Option<PathBuf> {
-    ProjectDirs::from("com", APP_NAME, APP_NAME).map(|proj| {
-        proj.data_local_dir()
-            .join("runtime")
-            .join(format!("{}.toml", sanitize_profile_name(profile)))
-    })
-}
-
-pub(crate) fn runtime_state_path_for_ephemeral() -> Option<PathBuf> {
-    ProjectDirs::from("com", APP_NAME, APP_NAME)
-        .map(|proj| proj.data_local_dir().join("runtime").join("ephemeral.toml"))
-}
-
-pub(crate) fn load_runtime_state(path: &Path) -> Option<RuntimeOwnershipState> {
-    let content = match fs::read_to_string(path) {
-        Ok(data) => data,
-        Err(_) => return None,
-    };
-
-    match toml::from_str(&content) {
-        Ok(state) => Some(state),
-        Err(_) => None,
-    }
-}
-
-pub(crate) fn save_runtime_state(path: &Path, state: &RuntimeOwnershipState) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| format!("failed to create runtime dir: {err}"))?;
-    }
-
-    let payload = toml::to_string_pretty(state)
-        .map_err(|err| format!("failed to serialize runtime state: {err}"))?;
-    fs::write(path, payload).map_err(|err| format!("failed to write runtime state: {err}"))?;
-    Ok(())
-}
-
-pub(crate) fn clear_runtime_state(path: &Path) -> Result<(), String> {
-    if path.exists() {
-        fs::remove_file(path).map_err(|err| format!("failed to remove runtime state: {err}"))?;
-    }
-    Ok(())
 }
 
 pub(crate) fn apply_cli_overrides_to_config(
@@ -252,4 +211,119 @@ pub(crate) fn save_configuration(
     }
 
     true
+}
+
+pub(crate) fn runtime_state_path_for_profile(profile: &str) -> Option<PathBuf> {
+    ProjectDirs::from("com", APP_NAME, APP_NAME).map(|proj| {
+        proj.data_local_dir()
+            .join("runtime")
+            .join("profiles")
+            .join(format!("{}.toml", sanitize_profile_name(profile)))
+    })
+}
+
+pub(crate) fn runtime_state_path_for_ephemeral() -> Option<PathBuf> {
+    ProjectDirs::from("com", APP_NAME, APP_NAME)
+        .map(|proj| proj.data_local_dir().join("runtime").join("ephemeral.toml"))
+}
+
+pub(crate) enum RuntimeStateLoadResult {
+    Loaded(RuntimeOwnershipState),
+    Missing,
+    Invalid,
+}
+
+pub(crate) fn load_runtime_state_result(path: &Path) -> RuntimeStateLoadResult {
+    let content = match fs::read_to_string(path) {
+        Ok(data) => data,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return RuntimeStateLoadResult::Missing;
+        }
+        Err(err) => {
+            eprintln!(
+                "failed to read runtime state at {}: {}",
+                path.display(),
+                err
+            );
+            return RuntimeStateLoadResult::Invalid;
+        }
+    };
+
+    match toml::from_str(&content) {
+        Ok(state) => RuntimeStateLoadResult::Loaded(state),
+        Err(err) => {
+            eprintln!(
+                "failed to parse runtime state at {}: {}",
+                path.display(),
+                err
+            );
+            RuntimeStateLoadResult::Invalid
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn load_runtime_state(path: &Path) -> Option<RuntimeOwnershipState> {
+    match load_runtime_state_result(path) {
+        RuntimeStateLoadResult::Loaded(state) => Some(state),
+        RuntimeStateLoadResult::Missing | RuntimeStateLoadResult::Invalid => None,
+    }
+}
+
+pub(crate) fn save_runtime_state(path: &Path, state: &RuntimeOwnershipState) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| format!("failed to create runtime dir: {err}"))?;
+    }
+
+    let payload = toml::to_string_pretty(state)
+        .map_err(|err| format!("failed to serialize runtime state: {err}"))?;
+    fs::write(path, payload).map_err(|err| format!("failed to write runtime state: {err}"))?;
+    Ok(())
+}
+
+pub(crate) fn clear_runtime_state(path: &Path) -> Result<(), String> {
+    if path.exists() {
+        fs::remove_file(path).map_err(|err| format!("failed to remove runtime state: {err}"))?;
+    }
+    Ok(())
+}
+
+pub fn reconcile_startup_runtime_state(mut startup: crate::StartupState) -> crate::StartupState {
+    let Some(runtime_path) = &startup.runtime_state_path else {
+        return startup;
+    };
+
+    let Some(runtime_ownership) = &startup.runtime_ownership else {
+        return startup;
+    };
+
+    let result = crate::process::reconcile_runtime_state(
+        runtime_ownership,
+        crate::process::is_process_group_alive,
+    );
+
+    match result {
+        crate::process::RuntimeReconcileResult::RestoreRunning => {
+            startup.restored_running = true;
+            startup.startup_message = Some(RUNTIME_RESTORED_MESSAGE.to_string());
+        }
+        crate::process::RuntimeReconcileResult::ClearStale => {
+            if let Err(err) = clear_runtime_state(runtime_path) {
+                eprintln!("failed to clear stale runtime state: {err}");
+            }
+            startup.runtime_ownership = None;
+            startup.restored_running = false;
+            startup.startup_message = Some(RUNTIME_STALE_CLEARED_MESSAGE.to_string());
+        }
+        crate::process::RuntimeReconcileResult::IgnoreInvalid => {
+            if let Err(err) = clear_runtime_state(runtime_path) {
+                eprintln!("failed to clear invalid runtime state: {err}");
+            }
+            startup.runtime_ownership = None;
+            startup.restored_running = false;
+            startup.startup_message = Some(RUNTIME_INVALID_CLEARED_MESSAGE.to_string());
+        }
+    }
+
+    startup
 }
