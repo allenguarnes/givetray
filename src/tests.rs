@@ -470,14 +470,14 @@ fn startup_state_can_mark_profile_lock_conflict() {
         restored_running: false,
         owns_profile_lock: false,
         profile_lock: None,
-        startup_message: Some("profile already open".to_string()),
+        startup_message: Some(RUNTIME_ALREADY_OPEN_MESSAGE.to_string()),
     };
 
     assert!(!startup.owns_profile_lock);
     assert!(startup.profile_lock.is_none());
     assert_eq!(
         startup.startup_message.as_deref(),
-        Some("profile already open")
+        Some(RUNTIME_ALREADY_OPEN_MESSAGE)
     );
 }
 
@@ -493,7 +493,38 @@ fn startup_state_default_owns_profile_lock_for_persistent_profile() {
     let startup = build_startup_state(&cli).expect("persistent startup should build");
 
     assert!(startup.owns_profile_lock);
-    assert!(startup.profile_lock.is_none());
+    assert!(startup.profile_lock.is_some());
+}
+
+#[test]
+fn second_same_profile_instance_skips_runtime_recovery() {
+    let _env_lock = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let temp_root = unique_test_dir("second-instance-runtime-skip");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let cli = parse_cli_args_from(["givetray", "-c", "default"])
+        .expect("persistent profile mode should parse");
+
+    let startup1 = build_startup_state(&cli).expect("first instance should build");
+    assert!(startup1.owns_profile_lock);
+    assert!(startup1.profile_lock.is_some());
+
+    let startup2 = build_startup_state(&cli).expect("second instance should build");
+    assert!(!startup2.owns_profile_lock);
+    assert!(startup2.profile_lock.is_none());
+    assert!(startup2.runtime_ownership.is_none());
+    assert_eq!(
+        startup2.startup_message.as_deref(),
+        Some(RUNTIME_ALREADY_OPEN_MESSAGE)
+    );
+
+    drop(startup1);
+
+    let startup3 =
+        build_startup_state(&cli).expect("third instance should build after lock release");
+    assert!(startup3.owns_profile_lock);
+    assert!(startup3.profile_lock.is_some());
 }
 
 #[test]

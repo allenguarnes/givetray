@@ -1,12 +1,12 @@
 use crate::config::{
-    apply_cli_overrides_to_config, clear_runtime_state, config_path_for_profile,
-    load_or_create_config, load_runtime_state_result, resolve_log_file_path,
-    runtime_state_path_for_ephemeral, runtime_state_path_for_profile, save_config,
-    RuntimeStateLoadResult,
+    acquire_profile_lock, apply_cli_overrides_to_config, clear_runtime_state,
+    config_path_for_profile, load_or_create_config, load_runtime_state_result,
+    profile_lock_path_for_profile, resolve_log_file_path, runtime_state_path_for_ephemeral,
+    runtime_state_path_for_profile, save_config, RuntimeStateLoadResult,
 };
 use crate::{
     CliMode, CliOptions, CliRequest, CliRunTarget, Config, PersistentConfigAccess, StartupState,
-    APP_NAME, BG_CHILD_ENV, MAX_COMMAND_LENGTH, MAX_PROFILE_LENGTH,
+    APP_NAME, BG_CHILD_ENV, MAX_COMMAND_LENGTH, MAX_PROFILE_LENGTH, RUNTIME_ALREADY_OPEN_MESSAGE,
     RUNTIME_INVALID_CLEARED_MESSAGE,
 };
 use std::env;
@@ -161,9 +161,21 @@ pub(crate) fn build_startup_state(cli: &CliOptions) -> Result<StartupState, Stri
                 Err(err) => return Err(format!("failed to apply CLI overrides: {err}")),
             }
 
-            let runtime_state_path = runtime_state_path_for_profile(profile);
-            let (runtime_ownership, startup_message) =
-                load_startup_runtime_state(runtime_state_path.as_deref());
+            let lock_path = profile_lock_path_for_profile(profile);
+            let (owns_profile_lock, profile_lock) = match lock_path {
+                Some(ref path) => match acquire_profile_lock(path) {
+                    Ok(handle) => (true, Some(handle)),
+                    Err(_) => (false, None),
+                },
+                None => (true, None),
+            };
+
+            let (runtime_ownership, startup_message) = if owns_profile_lock {
+                let runtime_state_path = runtime_state_path_for_profile(profile);
+                load_startup_runtime_state(runtime_state_path.as_deref())
+            } else {
+                (None, Some(RUNTIME_ALREADY_OPEN_MESSAGE.to_string()))
+            };
 
             Ok(StartupState {
                 profile_label: profile.clone(),
@@ -174,11 +186,15 @@ pub(crate) fn build_startup_state(cli: &CliOptions) -> Result<StartupState, Stri
                 log_file_path: resolve_log_file_path(profile, &config),
                 launch_on_startup: config.autostart,
                 config,
-                runtime_state_path,
+                runtime_state_path: if owns_profile_lock {
+                    runtime_state_path_for_profile(profile)
+                } else {
+                    None
+                },
                 runtime_ownership,
                 restored_running: false,
-                owns_profile_lock: true,
-                profile_lock: None,
+                owns_profile_lock,
+                profile_lock,
                 startup_message,
             })
         }

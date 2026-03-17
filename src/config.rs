@@ -234,8 +234,6 @@ pub(crate) fn runtime_state_path_for_profile(profile: &str) -> Option<PathBuf> {
     })
 }
 
-// TODO(task-3): wire profile lock helpers into startup path.
-#[allow(dead_code)]
 pub(crate) fn profile_lock_path_for_profile(profile: &str) -> Option<PathBuf> {
     ProjectDirs::from("com", APP_NAME, APP_NAME).map(|proj| {
         proj.data_local_dir()
@@ -245,8 +243,6 @@ pub(crate) fn profile_lock_path_for_profile(profile: &str) -> Option<PathBuf> {
     })
 }
 
-// TODO(task-3): wire profile lock helpers into startup path.
-#[allow(dead_code)]
 pub(crate) fn acquire_profile_lock(path: &Path) -> Result<ProfileLockHandle, String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| format!("failed to create lock dir: {err}"))?;

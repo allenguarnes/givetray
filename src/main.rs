@@ -78,6 +78,7 @@ const RUNTIME_STALE_CLEARED_MESSAGE: &str = "cleared stale runtime state from pr
 const RUNTIME_INVALID_CLEARED_MESSAGE: &str = "cleared invalid runtime state from previous session";
 const RUNTIME_STOP_FAILED_MESSAGE: &str =
     "failed to stop managed process group; process may still be running";
+const RUNTIME_ALREADY_OPEN_MESSAGE: &str = "profile already open";
 
 #[derive(Debug, Clone)]
 struct CliOptions {
