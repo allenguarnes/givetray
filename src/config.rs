@@ -14,7 +14,14 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 pub(crate) struct ProfileLockHandle {
-    pub(crate) _file: fs::File,
+    // Keep the descriptor open so the advisory flock remains held.
+    pub(crate) lock_file: fs::File,
+}
+
+impl Drop for ProfileLockHandle {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::flock(self.lock_file.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 pub(crate) fn config_path_for_profile(profile: &str) -> Option<PathBuf> {
@@ -227,6 +234,8 @@ pub(crate) fn runtime_state_path_for_profile(profile: &str) -> Option<PathBuf> {
     })
 }
 
+// TODO(task-3): wire profile lock helpers into startup path.
+#[allow(dead_code)]
 pub(crate) fn profile_lock_path_for_profile(profile: &str) -> Option<PathBuf> {
     ProjectDirs::from("com", APP_NAME, APP_NAME).map(|proj| {
         proj.data_local_dir()
@@ -236,6 +245,8 @@ pub(crate) fn profile_lock_path_for_profile(profile: &str) -> Option<PathBuf> {
     })
 }
 
+// TODO(task-3): wire profile lock helpers into startup path.
+#[allow(dead_code)]
 pub(crate) fn acquire_profile_lock(path: &Path) -> Result<ProfileLockHandle, String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| format!("failed to create lock dir: {err}"))?;
@@ -245,6 +256,7 @@ pub(crate) fn acquire_profile_lock(path: &Path) -> Result<ProfileLockHandle, Str
         .create(true)
         .read(true)
         .write(true)
+        .truncate(false)
         .open(path)
         .map_err(|err| format!("failed to open profile lock file: {err}"))?;
 
@@ -254,7 +266,7 @@ pub(crate) fn acquire_profile_lock(path: &Path) -> Result<ProfileLockHandle, Str
         return Err(format!("failed to acquire profile lock: {err}"));
     }
 
-    Ok(ProfileLockHandle { _file: file })
+    Ok(ProfileLockHandle { lock_file: file })
 }
 
 pub(crate) fn runtime_state_path_for_ephemeral() -> Option<PathBuf> {

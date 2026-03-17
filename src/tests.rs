@@ -867,6 +867,21 @@ fn acquiring_same_profile_lock_twice_fails() {
 }
 
 #[test]
+fn dropping_profile_lock_releases_for_reacquisition() {
+    let _env_lock = ENV_LOCK.lock().expect("env lock should be acquired");
+    let temp_root = unique_test_dir("profile-lock-release-reacquire");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let path = profile_lock_path_for_profile("release-test").expect("lock path should resolve");
+    {
+        let _lock = acquire_profile_lock(&path).expect("first lock should succeed");
+    }
+
+    let _second = acquire_profile_lock(&path).expect("second lock should succeed after drop");
+}
+
+#[test]
 fn runtime_state_path_resolves_for_ephemeral() {
     let _env_lock = ENV_LOCK.lock().expect("env lock should be acquired");
     let temp_root = unique_test_dir("runtime-state-ephemeral-path");
