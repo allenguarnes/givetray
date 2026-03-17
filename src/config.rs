@@ -1,5 +1,5 @@
 use crate::desktop::copy_icon_to_profile;
-use crate::logs::append_log;
+use crate::logs::{append_log, profile_lock_action_blocked_message};
 use crate::{
     AppState, CliOptions, Config, RuntimeOwnershipState, APP_NAME, DEFAULT_COMMAND,
     DEFAULT_PROFILE, RUNTIME_INVALID_CLEARED_MESSAGE, RUNTIME_RESTORED_MESSAGE,
@@ -168,6 +168,11 @@ pub(crate) fn save_configuration(
     log_to_file_enabled: bool,
 ) -> bool {
     let mut state = state.borrow_mut();
+    if !can_save_profile_configuration(state.owns_profile_lock) {
+        append_log(&mut state, profile_lock_action_blocked_message());
+        return false;
+    }
+
     let Some(access) = state.persistent_config_access.clone() else {
         append_log(
             &mut state,
@@ -223,6 +228,10 @@ pub(crate) fn save_configuration(
     }
 
     true
+}
+
+pub(crate) fn can_save_profile_configuration(owns_profile_lock: bool) -> bool {
+    owns_profile_lock
 }
 
 pub(crate) fn runtime_state_path_for_profile(profile: &str) -> Option<PathBuf> {

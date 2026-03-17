@@ -1,8 +1,8 @@
 use crate::cli::should_expose_configuration;
 use crate::config::save_configuration;
 use crate::desktop::{applications_desktop_path, apply_desktop_actions, autostart_desktop_path};
-use crate::logs::{append_log, buffer_text};
-use crate::process::{start_command, stop_command, stop_command_blocking};
+use crate::logs::{append_log, buffer_text, profile_lock_action_blocked_message};
+use crate::process::{can_control_profile, start_command, stop_command, stop_command_blocking};
 use crate::{AppState, ConfigCloseAction, UiEvent, MAX_UNDO};
 use async_channel::Sender;
 use glib::{ControlFlow, LogLevels, Propagation};
@@ -552,10 +552,20 @@ pub(crate) fn setup_menu_polling(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiE
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             let id = event.id;
             if id == "start-stop" {
-                let running = {
+                let (running, can_control) = {
                     let state = state.borrow();
-                    state.child.is_some() || state.owned_pgid.is_some()
+                    (
+                        state.child.is_some() || state.owned_pgid.is_some(),
+                        can_control_profile(state.owns_profile_lock),
+                    )
                 };
+                if !can_control {
+                    append_log(
+                        &mut state.borrow_mut(),
+                        profile_lock_action_blocked_message(),
+                    );
+                    continue;
+                }
                 if running {
                     stop_command(state.clone(), ui_tx.clone());
                 } else {

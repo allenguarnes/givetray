@@ -1,3 +1,4 @@
+use crate::logs::profile_lock_action_blocked_message;
 use crate::{
     config::clear_runtime_state, config::save_runtime_state, AppState, RuntimeOwnershipState,
     UiEvent, BG_CHILD_ENV, RUNTIME_STOP_FAILED_MESSAGE,
@@ -276,7 +277,16 @@ pub fn persist_launch_metadata_with_start_time(
     save_runtime_state(runtime_state_path, &state)
 }
 
+pub(crate) fn can_control_profile(owns_profile_lock: bool) -> bool {
+    owns_profile_lock
+}
+
 pub(crate) fn start_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>) {
+    if !can_control_profile(state.borrow().owns_profile_lock) {
+        let _ = ui_tx.send_blocking(UiEvent::AppendLog(profile_lock_action_blocked_message()));
+        return;
+    }
+
     let has_active_process = state.borrow().child.is_some() || state.borrow().owned_pgid.is_some();
     if has_active_process {
         let _ = ui_tx.send_blocking(UiEvent::AppendLog("command is already running".to_string()));
@@ -377,6 +387,11 @@ pub(crate) fn start_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>
 }
 
 pub(crate) fn stop_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>) {
+    if !can_control_profile(state.borrow().owns_profile_lock) {
+        let _ = ui_tx.send_blocking(UiEvent::AppendLog(profile_lock_action_blocked_message()));
+        return;
+    }
+
     let pgid = state.borrow().owned_pgid;
 
     if let Some(pgid) = pgid {

@@ -11,6 +11,13 @@ use std::io::{LineWriter, Write};
 use std::path::Path;
 use std::{cell::RefCell, rc::Rc};
 
+pub(crate) const PROFILE_LOCK_ACTION_BLOCKED_MESSAGE: &str =
+    "profile already open in another session; start/stop and configuration save are disabled";
+
+pub(crate) fn profile_lock_action_blocked_message() -> String {
+    PROFILE_LOCK_ACTION_BLOCKED_MESSAGE.to_string()
+}
+
 pub(crate) fn clear_runtime_state_after_exit(runtime_state_path: Option<&Path>) {
     if let Some(path) = runtime_state_path {
         if let Err(err) = clear_runtime_state(path) {

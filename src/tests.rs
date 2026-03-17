@@ -6,14 +6,16 @@ use crate::cli::{
 };
 use crate::config::config_path_for_profile;
 use crate::config::{
-    acquire_profile_lock, clear_runtime_state, load_runtime_state, profile_lock_path_for_profile,
-    reconcile_startup_runtime_state, runtime_state_path_for_ephemeral,
-    runtime_state_path_for_profile, save_config, save_runtime_state,
+    acquire_profile_lock, can_save_profile_configuration, clear_runtime_state, load_runtime_state,
+    profile_lock_path_for_profile, reconcile_startup_runtime_state,
+    runtime_state_path_for_ephemeral, runtime_state_path_for_profile, save_config,
+    save_runtime_state,
 };
 use crate::logs::{
     append_log_to_file, clear_runtime_state_after_exit, extract_log_links,
     should_activate_log_link, strip_ansi_codes,
 };
+use crate::process::can_control_profile;
 use crate::process::is_process_group_alive;
 use crate::process::reconcile_runtime_state;
 use crate::process::RuntimeReconcileResult;
@@ -910,6 +912,16 @@ fn dropping_profile_lock_releases_for_reacquisition() {
     }
 
     let _second = acquire_profile_lock(&path).expect("second lock should succeed after drop");
+}
+
+#[test]
+fn non_owning_profile_session_cannot_start_command() {
+    assert!(!can_control_profile(false));
+}
+
+#[test]
+fn non_owning_profile_session_cannot_save_configuration() {
+    assert!(!can_save_profile_configuration(false));
 }
 
 #[test]
