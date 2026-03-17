@@ -6,9 +6,9 @@ use crate::cli::{
 };
 use crate::config::config_path_for_profile;
 use crate::config::{
-    clear_runtime_state, load_runtime_state, reconcile_startup_runtime_state,
-    runtime_state_path_for_ephemeral, runtime_state_path_for_profile, save_config,
-    save_runtime_state,
+    acquire_profile_lock, clear_runtime_state, load_runtime_state, profile_lock_path_for_profile,
+    reconcile_startup_runtime_state, runtime_state_path_for_ephemeral,
+    runtime_state_path_for_profile, save_config, save_runtime_state,
 };
 use crate::logs::{
     append_log_to_file, clear_runtime_state_after_exit, extract_log_links,
@@ -839,6 +839,31 @@ fn runtime_state_path_resolves_for_profile() {
     assert!(path.is_some());
     let path = path.unwrap();
     assert!(path.to_string_lossy().contains("my-profile"));
+}
+
+#[test]
+fn profile_lock_path_resolves_for_profile() {
+    let _env_lock = ENV_LOCK.lock().expect("env lock should be acquired");
+    let temp_root = unique_test_dir("profile-lock-path");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let path = profile_lock_path_for_profile("demo").expect("lock path should resolve");
+
+    assert!(path.to_string_lossy().contains("demo"));
+}
+
+#[test]
+fn acquiring_same_profile_lock_twice_fails() {
+    let _env_lock = ENV_LOCK.lock().expect("env lock should be acquired");
+    let temp_root = unique_test_dir("profile-lock-double-acquire");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let path = profile_lock_path_for_profile("demo").expect("lock path should resolve");
+    let _first = acquire_profile_lock(&path).expect("first lock should succeed");
+
+    assert!(acquire_profile_lock(&path).is_err());
 }
 
 #[test]

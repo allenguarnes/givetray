@@ -9,6 +9,7 @@ use directories::ProjectDirs;
 use gtk::prelude::*;
 use std::cell::RefCell;
 use std::fs;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -224,6 +225,36 @@ pub(crate) fn runtime_state_path_for_profile(profile: &str) -> Option<PathBuf> {
             .join("profiles")
             .join(format!("{}.toml", sanitize_profile_name(profile)))
     })
+}
+
+pub(crate) fn profile_lock_path_for_profile(profile: &str) -> Option<PathBuf> {
+    ProjectDirs::from("com", APP_NAME, APP_NAME).map(|proj| {
+        proj.data_local_dir()
+            .join("runtime")
+            .join("profiles")
+            .join(format!("{}.lock", sanitize_profile_name(profile)))
+    })
+}
+
+pub(crate) fn acquire_profile_lock(path: &Path) -> Result<ProfileLockHandle, String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| format!("failed to create lock dir: {err}"))?;
+    }
+
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|err| format!("failed to open profile lock file: {err}"))?;
+
+    let status = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if status != 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(format!("failed to acquire profile lock: {err}"));
+    }
+
+    Ok(ProfileLockHandle { _file: file })
 }
 
 pub(crate) fn runtime_state_path_for_ephemeral() -> Option<PathBuf> {
