@@ -411,6 +411,8 @@ fn ephemeral_mode_hides_configuration_menu() {
         runtime_state_path: None,
         runtime_ownership: None,
         restored_running: false,
+        owns_profile_lock: true,
+        profile_lock: None,
         startup_message: None,
     };
 
@@ -439,12 +441,44 @@ fn persistent_mode_exposes_configuration_menu() {
         runtime_state_path: None,
         runtime_ownership: None,
         restored_running: false,
+        owns_profile_lock: true,
+        profile_lock: None,
         startup_message: None,
     };
 
     assert!(should_expose_configuration(
         startup.persistent_config_access.as_ref()
     ));
+}
+
+#[test]
+fn startup_state_can_mark_profile_lock_conflict() {
+    let startup = StartupState {
+        profile_label: "default".to_string(),
+        persistent_config_access: None,
+        config: Config {
+            command: DEFAULT_COMMAND.to_string(),
+            autostart: false,
+            icon_path: None,
+            log_to_file: false,
+            log_file_path: None,
+        },
+        log_file_path: None,
+        launch_on_startup: false,
+        runtime_state_path: None,
+        runtime_ownership: None,
+        restored_running: false,
+        owns_profile_lock: false,
+        profile_lock: None,
+        startup_message: Some("profile already open".to_string()),
+    };
+
+    assert!(!startup.owns_profile_lock);
+    assert!(startup.profile_lock.is_none());
+    assert_eq!(
+        startup.startup_message.as_deref(),
+        Some("profile already open")
+    );
 }
 
 #[test]
@@ -491,6 +525,8 @@ fn persistent_startup_state_exposes_configuration_from_source_of_truth() {
         runtime_state_path: None,
         runtime_ownership: None,
         restored_running: false,
+        owns_profile_lock: true,
+        profile_lock: None,
         startup_message: None,
     };
 
@@ -1013,6 +1049,8 @@ fn startup_runtime_state_no_state_stops() {
         runtime_state_path: None,
         runtime_ownership: None,
         restored_running: false,
+        owns_profile_lock: true,
+        profile_lock: None,
         startup_message: None,
     };
 
@@ -1050,6 +1088,8 @@ fn startup_runtime_state_recovered_running() {
         runtime_state_path: Some(PathBuf::from("/tmp/runtime-state.toml")),
         runtime_ownership: Some(ownership),
         restored_running: true,
+        owns_profile_lock: true,
+        profile_lock: None,
         startup_message: None,
     };
 
@@ -1088,6 +1128,8 @@ fn startup_runtime_state_stale_clears() {
         runtime_state_path: Some(PathBuf::from("/tmp/runtime-state.toml")),
         runtime_ownership: Some(ownership),
         restored_running: false,
+        owns_profile_lock: true,
+        profile_lock: None,
         startup_message: None,
     };
 
@@ -1136,6 +1178,8 @@ fn startup_reconcile_dead_runtime_state_gets_cleared() {
         runtime_state_path: Some(state_path.clone()),
         runtime_ownership: Some(dead_state),
         restored_running: false,
+        owns_profile_lock: true,
+        profile_lock: None,
         startup_message: None,
     };
 
@@ -1193,6 +1237,8 @@ fn startup_reconcile_live_runtime_state_sets_restored_running() {
         runtime_state_path: Some(state_path),
         runtime_ownership: Some(live_state),
         restored_running: false,
+        owns_profile_lock: true,
+        profile_lock: None,
         startup_message: None,
     };
 
@@ -1242,6 +1288,8 @@ fn startup_reconcile_invalid_runtime_state_falls_back_to_stopped() {
         runtime_state_path: Some(state_path.clone()),
         runtime_ownership: Some(invalid_state),
         restored_running: false,
+        owns_profile_lock: true,
+        profile_lock: None,
         startup_message: None,
     };
 
@@ -1302,6 +1350,8 @@ fn should_launch_on_startup_skips_relaunch_for_restored_run() {
         runtime_state_path: None,
         runtime_ownership: None,
         restored_running: true,
+        owns_profile_lock: true,
+        profile_lock: None,
         startup_message: None,
     };
 
@@ -1325,6 +1375,8 @@ fn should_launch_on_startup_runs_when_not_restored() {
         runtime_state_path: None,
         runtime_ownership: None,
         restored_running: false,
+        owns_profile_lock: true,
+        profile_lock: None,
         startup_message: None,
     };
 
@@ -1362,6 +1414,8 @@ fn startup_reconcile_sets_restored_message() {
             ephemeral: false,
         }),
         restored_running: false,
+        owns_profile_lock: true,
+        profile_lock: None,
         startup_message: None,
     };
 

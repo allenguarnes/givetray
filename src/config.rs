@@ -12,6 +12,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+pub(crate) struct ProfileLockHandle {
+    pub(crate) _file: fs::File,
+}
+
 pub(crate) fn config_path_for_profile(profile: &str) -> Option<PathBuf> {
     ProjectDirs::from("com", APP_NAME, APP_NAME).map(|proj| {
         proj.config_dir()

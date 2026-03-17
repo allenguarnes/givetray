@@ -11,7 +11,7 @@ use crate::cli::{
     parse_cli_args, prepare_run_startup, should_expose_configuration, tray_tooltip,
     validate_runtime_mode,
 };
-use crate::config::reconcile_startup_runtime_state;
+use crate::config::{reconcile_startup_runtime_state, ProfileLockHandle};
 use crate::desktop::{create_desktop_file_from_cli, load_tray_icon, load_window_icon_pixbuf};
 use crate::logs::{build_logs_window, setup_log_receiver, setup_logs_handlers};
 use crate::process::start_command;
@@ -153,6 +153,8 @@ struct AppState {
     process_exit_reported: bool,
     runtime_state_path: Option<PathBuf>,
     restored_running: bool,
+    owns_profile_lock: bool,
+    profile_lock: Option<ProfileLockHandle>,
     log_lines: VecDeque<String>,
     log_links: VecDeque<Vec<LogLink>>,
     log_file_path: Option<PathBuf>,
@@ -211,6 +213,8 @@ struct StartupState {
     runtime_state_path: Option<PathBuf>,
     runtime_ownership: Option<RuntimeOwnershipState>,
     restored_running: bool,
+    owns_profile_lock: bool,
+    profile_lock: Option<ProfileLockHandle>,
     startup_message: Option<String>,
 }
 
@@ -372,6 +376,8 @@ fn main() {
         process_exit_reported: false,
         runtime_state_path: startup.runtime_state_path,
         restored_running: startup.restored_running,
+        owns_profile_lock: startup.owns_profile_lock,
+        profile_lock: startup.profile_lock,
         log_lines: VecDeque::new(),
         log_links: VecDeque::new(),
         log_file_path: startup.log_file_path,
@@ -400,6 +406,11 @@ fn main() {
         config_ignore: false,
         start_stop_item,
     }));
+
+    {
+        let app = state.borrow();
+        debug_assert!(app.owns_profile_lock || app.profile_lock.is_none());
+    }
 
     if let Some(message) = startup_message {
         logs::append_log(&mut state.borrow_mut(), message);
