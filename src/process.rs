@@ -1,7 +1,7 @@
 use crate::logs::profile_lock_action_blocked_message;
 use crate::{
-    config::clear_runtime_state, config::save_runtime_state, AppState, RuntimeOwnershipState,
-    UiEvent, BG_CHILD_ENV, RUNTIME_STOP_FAILED_MESSAGE,
+    coalesced_log_overflow_message, config::clear_runtime_state, config::save_runtime_state,
+    AppState, RuntimeOwnershipState, UiEvent, BG_CHILD_ENV, RUNTIME_STOP_FAILED_MESSAGE,
 };
 use async_channel::Sender;
 use gtk::prelude::*;
@@ -445,17 +445,47 @@ pub(crate) fn stop_command_blocking(state: Rc<RefCell<AppState>>) {
 fn spawn_reader<R: std::io::Read + Send + 'static>(reader: R, ui_tx: Sender<UiEvent>) {
     thread::spawn(move || {
         let buf = BufReader::new(reader);
+        let mut dropped_lines = 0usize;
+
         for line in buf.lines() {
             match line {
                 Ok(line) => {
-                    let _ = ui_tx.send_blocking(UiEvent::AppendLog(line));
+                    if dropped_lines > 0 {
+                        match ui_tx.try_send(UiEvent::AppendLog(coalesced_log_overflow_message(
+                            dropped_lines,
+                        ))) {
+                            Ok(()) => dropped_lines = 0,
+                            Err(async_channel::TrySendError::Full(_)) => {
+                                dropped_lines += 1;
+                                continue;
+                            }
+                            Err(async_channel::TrySendError::Closed(_)) => break,
+                        }
+                    }
+
+                    match ui_tx.try_send(UiEvent::AppendLog(line)) {
+                        Ok(()) => {}
+                        Err(async_channel::TrySendError::Full(_)) => dropped_lines += 1,
+                        Err(async_channel::TrySendError::Closed(_)) => break,
+                    }
                 }
                 Err(err) => {
-                    let _ =
-                        ui_tx.send_blocking(UiEvent::AppendLog(format!("log read error: {err}")));
+                    if dropped_lines > 0 {
+                        let _ = ui_tx.try_send(UiEvent::AppendLog(coalesced_log_overflow_message(
+                            dropped_lines,
+                        )));
+                    }
+
+                    let _ = ui_tx.try_send(UiEvent::AppendLog(format!("log read error: {err}")));
                     break;
                 }
             }
+        }
+
+        if dropped_lines > 0 {
+            let _ = ui_tx.try_send(UiEvent::AppendLog(coalesced_log_overflow_message(
+                dropped_lines,
+            )));
         }
     });
 }

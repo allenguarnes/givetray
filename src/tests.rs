@@ -925,6 +925,12 @@ fn non_owning_profile_session_cannot_save_configuration() {
 }
 
 #[test]
+fn log_overflow_is_coalesced_into_one_message() {
+    let msg = coalesced_log_overflow_message(42);
+    assert!(msg.contains("42"));
+}
+
+#[test]
 fn runtime_state_path_resolves_for_ephemeral() {
     let _env_lock = ENV_LOCK.lock().expect("env lock should be acquired");
     let temp_root = unique_test_dir("runtime-state-ephemeral-path");

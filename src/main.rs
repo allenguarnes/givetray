@@ -65,6 +65,7 @@ const APP_NAME: &str = "givetray";
 const DEFAULT_PROFILE: &str = "default";
 const DEFAULT_COMMAND: &str = "echo configure command";
 const MAX_LOG_LINES: usize = 5000;
+const UI_EVENT_CHANNEL_CAPACITY: usize = 750;
 const MAX_UNDO: usize = 200;
 const MAX_COMMAND_LENGTH: usize = 8192;
 const MAX_PROFILE_LENGTH: usize = 128;
@@ -79,6 +80,11 @@ const RUNTIME_INVALID_CLEARED_MESSAGE: &str = "cleared invalid runtime state fro
 const RUNTIME_STOP_FAILED_MESSAGE: &str =
     "failed to stop managed process group; process may still be running";
 const RUNTIME_ALREADY_OPEN_MESSAGE: &str = "profile already open";
+
+pub(crate) fn coalesced_log_overflow_message(count: usize) -> String {
+    let suffix = if count == 1 { "" } else { "s" };
+    format!("log queue saturated; dropped {count} line{suffix}")
+}
 
 #[derive(Debug, Clone)]
 struct CliOptions {
@@ -317,7 +323,7 @@ fn main() {
         about_window.set_icon(Some(icon));
     }
 
-    let (ui_tx, ui_rx) = async_channel::unbounded::<UiEvent>();
+    let (ui_tx, ui_rx) = async_channel::bounded::<UiEvent>(UI_EVENT_CHANNEL_CAPACITY);
 
     let start_stop_id = MenuId::new("start-stop");
     let logs_id = MenuId::new("logs");
