@@ -268,6 +268,10 @@ pub(crate) fn acquire_profile_lock(path: &Path) -> Result<ProfileLockHandle, Str
     let status = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if status != 0 {
         let err = std::io::Error::last_os_error();
+        let raw_os_error = err.raw_os_error();
+        if raw_os_error == Some(libc::EWOULDBLOCK) || raw_os_error == Some(libc::EAGAIN) {
+            return Err("profile lock already held by another process".to_string());
+        }
         return Err(format!("failed to acquire profile lock: {err}"));
     }
 
