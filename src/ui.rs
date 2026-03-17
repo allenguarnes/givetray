@@ -1,7 +1,9 @@
 use crate::cli::should_expose_configuration;
 use crate::config::save_configuration;
 use crate::desktop::{applications_desktop_path, apply_desktop_actions, autostart_desktop_path};
-use crate::logs::{append_log, buffer_text, profile_lock_action_blocked_message};
+use crate::logs::{
+    append_log, apply_process_exited, buffer_text, profile_lock_action_blocked_message,
+};
 use crate::process::{can_control_profile, start_command, stop_command, stop_command_blocking};
 use crate::{AppState, ConfigCloseAction, UiEvent, MAX_UNDO};
 use async_channel::Sender;
@@ -717,16 +719,24 @@ pub(crate) fn setup_process_watcher(state: Rc<RefCell<AppState>>, ui_tx: Sender<
         }
 
         if has_tracked_process {
-            let state = state.borrow();
-            let child_done = state.child.is_none();
-            let group_gone = state.owned_pgid.is_none();
+            let (child_done, group_gone) = {
+                let state_ref = state.borrow();
+                (state_ref.child.is_none(), state_ref.owned_pgid.is_none())
+            };
             if should_emit_process_exited(
                 has_tracked_process,
                 child_done,
                 group_gone,
                 exit_already_reported,
             ) {
-                let _ = ui_tx.send_blocking(UiEvent::ProcessExited(exit_code));
+                match ui_tx.try_send(UiEvent::ProcessExited(exit_code)) {
+                    Ok(()) => {}
+                    Err(async_channel::TrySendError::Full(_))
+                    | Err(async_channel::TrySendError::Closed(_)) => {
+                        let mut state_ref = state.borrow_mut();
+                        apply_process_exited(&mut state_ref, exit_code);
+                    }
+                }
             }
         }
 

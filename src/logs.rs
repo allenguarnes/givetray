@@ -260,50 +260,55 @@ pub(crate) fn set_logs_status(label: &gtk::Label, line_count: usize, detail: Opt
     label.set_text(&text);
 }
 
+pub(crate) fn apply_process_exited(state: &mut AppState, code: Option<i32>) {
+    if state.process_exit_reported {
+        return;
+    }
+
+    let owned_was_cleared = state.owned_pgid.is_none() && state.child.is_none();
+
+    if owned_was_cleared {
+        clear_runtime_state_after_exit(state.runtime_state_path.as_deref());
+        state.restored_running = false;
+        state.start_stop_item.set_text("Start");
+    }
+
+    state.child = None;
+    state.process_exit_reported = true;
+
+    let msg = match code {
+        Some(code) => format!("command exited with code {code}"),
+        None => "command exited".to_string(),
+    };
+    append_log(state, msg);
+}
+
+pub(crate) fn apply_clear_runtime_state(state: &mut AppState) {
+    let owned_was_cleared = state.owned_pgid.is_none() && state.child.is_none();
+
+    if owned_was_cleared {
+        clear_runtime_state_after_exit(state.runtime_state_path.as_deref());
+        state.restored_running = false;
+    }
+
+    state.child = None;
+    state.owned_pgid = None;
+    state.owned_pid = None;
+}
+
 pub(crate) fn setup_log_receiver(state: Rc<RefCell<AppState>>, receiver: Receiver<UiEvent>) {
     MainContext::default().spawn_local(async move {
         while let Ok(event) = receiver.recv().await {
             let mut state = state.borrow_mut();
             match event {
                 UiEvent::AppendLog(line) => append_log(&mut state, line),
-                UiEvent::ProcessExited(code) => {
-                    if state.process_exit_reported {
-                        continue;
-                    }
-                    let owned_was_cleared = state.owned_pgid.is_none() && state.child.is_none();
-                    
-                    if owned_was_cleared {
-                        clear_runtime_state_after_exit(state.runtime_state_path.as_deref());
-                        state.restored_running = false;
-                        state.start_stop_item.set_text("Start");
-                    }
-                    
-                    state.child = None;
-                    state.process_exit_reported = true;
-                    
-                    let msg = match code {
-                        Some(code) => format!("command exited with code {code}"),
-                        None => "command exited".to_string(),
-                    };
-                    append_log(&mut state, msg);
-                }
+                UiEvent::ProcessExited(code) => apply_process_exited(&mut state, code),
                 UiEvent::SetRunning(running) => {
                     state
                         .start_stop_item
                         .set_text(if running { "Stop" } else { "Start" });
                 }
-                UiEvent::ClearRuntimeState => {
-                    let owned_was_cleared = state.owned_pgid.is_none() && state.child.is_none();
-                    
-                    if owned_was_cleared {
-                        clear_runtime_state_after_exit(state.runtime_state_path.as_deref());
-                        state.restored_running = false;
-                    }
-                    
-                    state.child = None;
-                    state.owned_pgid = None;
-                    state.owned_pid = None;
-                }
+                UiEvent::ClearRuntimeState => apply_clear_runtime_state(&mut state),
             }
         }
     });

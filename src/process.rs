@@ -281,15 +281,44 @@ pub(crate) fn can_control_profile(owns_profile_lock: bool) -> bool {
     owns_profile_lock
 }
 
+fn try_send_main_thread_event(ui_tx: &Sender<UiEvent>, event: UiEvent) -> bool {
+    match ui_tx.try_send(event) {
+        Ok(()) => true,
+        Err(async_channel::TrySendError::Full(_)) => false,
+        Err(async_channel::TrySendError::Closed(_)) => false,
+    }
+}
+
+fn flush_dropped_lines_blocking(ui_tx: &Sender<UiEvent>, dropped_lines: &mut usize) {
+    if *dropped_lines == 0 {
+        return;
+    }
+
+    if ui_tx
+        .send_blocking(UiEvent::AppendLog(coalesced_log_overflow_message(
+            *dropped_lines,
+        )))
+        .is_ok()
+    {
+        *dropped_lines = 0;
+    }
+}
+
 pub(crate) fn start_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>) {
     if !can_control_profile(state.borrow().owns_profile_lock) {
-        let _ = ui_tx.send_blocking(UiEvent::AppendLog(profile_lock_action_blocked_message()));
+        let _ = try_send_main_thread_event(
+            &ui_tx,
+            UiEvent::AppendLog(profile_lock_action_blocked_message()),
+        );
         return;
     }
 
     let has_active_process = state.borrow().child.is_some() || state.borrow().owned_pgid.is_some();
     if has_active_process {
-        let _ = ui_tx.send_blocking(UiEvent::AppendLog("command is already running".to_string()));
+        let _ = try_send_main_thread_event(
+            &ui_tx,
+            UiEvent::AppendLog("command is already running".to_string()),
+        );
         return;
     }
 
@@ -297,11 +326,17 @@ pub(crate) fn start_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>
     let mut args = match shell_words::split(&command) {
         Ok(parts) if !parts.is_empty() => parts,
         Ok(_) => {
-            let _ = ui_tx.send_blocking(UiEvent::AppendLog("command is empty".to_string()));
+            let _ = try_send_main_thread_event(
+                &ui_tx,
+                UiEvent::AppendLog("command is empty".to_string()),
+            );
             return;
         }
         Err(err) => {
-            let _ = ui_tx.send_blocking(UiEvent::AppendLog(format!("command parse error: {err}")));
+            let _ = try_send_main_thread_event(
+                &ui_tx,
+                UiEvent::AppendLog(format!("command parse error: {err}")),
+            );
             return;
         }
     };
@@ -311,9 +346,10 @@ pub(crate) fn start_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>
         match prompt_sudo_password() {
             Some(password) => Some(password),
             None => {
-                let _ = ui_tx.send_blocking(UiEvent::AppendLog(
-                    "sudo password prompt cancelled".to_string(),
-                ));
+                let _ = try_send_main_thread_event(
+                    &ui_tx,
+                    UiEvent::AppendLog("sudo password prompt cancelled".to_string()),
+                );
                 return;
             }
         }
@@ -325,7 +361,7 @@ pub(crate) fn start_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>
         match spawn_command_in_new_process_group(&args[0], &args[1..], sudo_password.is_some()) {
             Ok(result) => result,
             Err(err) => {
-                let _ = ui_tx.send_blocking(UiEvent::AppendLog(err));
+                let _ = try_send_main_thread_event(&ui_tx, UiEvent::AppendLog(err));
                 return;
             }
         };
@@ -336,14 +372,16 @@ pub(crate) fn start_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>
                 .write_all(password.as_bytes())
                 .and_then(|_| stdin.write_all(b"\n"))
             {
-                let _ = ui_tx.send_blocking(UiEvent::AppendLog(format!(
-                    "failed to send sudo password to process: {err}"
-                )));
+                let _ = try_send_main_thread_event(
+                    &ui_tx,
+                    UiEvent::AppendLog(format!("failed to send sudo password to process: {err}")),
+                );
             }
         } else {
-            let _ = ui_tx.send_blocking(UiEvent::AppendLog(
-                "unable to access sudo stdin pipe".to_string(),
-            ));
+            let _ = try_send_main_thread_event(
+                &ui_tx,
+                UiEvent::AppendLog("unable to access sudo stdin pipe".to_string()),
+            );
         }
     }
 
@@ -372,9 +410,10 @@ pub(crate) fn start_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>
         profile_name_owned,
         ephemeral,
     ) {
-        let _ = ui_tx.send_blocking(UiEvent::AppendLog(format!(
-            "failed to persist runtime state: {err}"
-        )));
+        let _ = try_send_main_thread_event(
+            &ui_tx,
+            UiEvent::AppendLog(format!("failed to persist runtime state: {err}")),
+        );
     }
 
     state.borrow_mut().child = Some(spawn_result.child);
@@ -382,13 +421,18 @@ pub(crate) fn start_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>
     state.borrow_mut().owned_pgid = Some(spawn_result.owned_pgid);
     state.borrow_mut().process_exit_reported = false;
 
-    let _ = ui_tx.send_blocking(UiEvent::SetRunning(true));
-    let _ = ui_tx.send_blocking(UiEvent::AppendLog("command started".to_string()));
+    if !try_send_main_thread_event(&ui_tx, UiEvent::SetRunning(true)) {
+        state.borrow().start_stop_item.set_text("Stop");
+    }
+    let _ = try_send_main_thread_event(&ui_tx, UiEvent::AppendLog("command started".to_string()));
 }
 
 pub(crate) fn stop_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>) {
     if !can_control_profile(state.borrow().owns_profile_lock) {
-        let _ = ui_tx.send_blocking(UiEvent::AppendLog(profile_lock_action_blocked_message()));
+        let _ = try_send_main_thread_event(
+            &ui_tx,
+            UiEvent::AppendLog(profile_lock_action_blocked_message()),
+        );
         return;
     }
 
@@ -470,11 +514,7 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(reader: R, ui_tx: Sender<UiEv
                     }
                 }
                 Err(err) => {
-                    if dropped_lines > 0 {
-                        let _ = ui_tx.try_send(UiEvent::AppendLog(coalesced_log_overflow_message(
-                            dropped_lines,
-                        )));
-                    }
+                    flush_dropped_lines_blocking(&ui_tx, &mut dropped_lines);
 
                     let _ = ui_tx.try_send(UiEvent::AppendLog(format!("log read error: {err}")));
                     break;
@@ -482,11 +522,7 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(reader: R, ui_tx: Sender<UiEv
             }
         }
 
-        if dropped_lines > 0 {
-            let _ = ui_tx.try_send(UiEvent::AppendLog(coalesced_log_overflow_message(
-                dropped_lines,
-            )));
-        }
+        flush_dropped_lines_blocking(&ui_tx, &mut dropped_lines);
     });
 }
 
