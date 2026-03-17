@@ -1,7 +1,9 @@
 use crate::desktop::copy_icon_to_profile;
 use crate::logs::append_log;
 use crate::{
-    AppState, CliOptions, Config, RuntimeOwnershipState, APP_NAME, DEFAULT_COMMAND, DEFAULT_PROFILE,
+    AppState, CliOptions, Config, RuntimeOwnershipState, APP_NAME, DEFAULT_COMMAND,
+    DEFAULT_PROFILE, RUNTIME_INVALID_CLEARED_MESSAGE, RUNTIME_RESTORED_MESSAGE,
+    RUNTIME_STALE_CLEARED_MESSAGE,
 };
 use directories::ProjectDirs;
 use gtk::prelude::*;
@@ -225,29 +227,46 @@ pub(crate) fn runtime_state_path_for_ephemeral() -> Option<PathBuf> {
         .map(|proj| proj.data_local_dir().join("runtime").join("ephemeral.toml"))
 }
 
-pub(crate) fn load_runtime_state(path: &Path) -> Option<RuntimeOwnershipState> {
+pub(crate) enum RuntimeStateLoadResult {
+    Loaded(RuntimeOwnershipState),
+    Missing,
+    Invalid,
+}
+
+pub(crate) fn load_runtime_state_result(path: &Path) -> RuntimeStateLoadResult {
     let content = match fs::read_to_string(path) {
         Ok(data) => data,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return RuntimeStateLoadResult::Missing;
+        }
         Err(err) => {
             eprintln!(
                 "failed to read runtime state at {}: {}",
                 path.display(),
                 err
             );
-            return None;
+            return RuntimeStateLoadResult::Invalid;
         }
     };
 
     match toml::from_str(&content) {
-        Ok(state) => Some(state),
+        Ok(state) => RuntimeStateLoadResult::Loaded(state),
         Err(err) => {
             eprintln!(
                 "failed to parse runtime state at {}: {}",
                 path.display(),
                 err
             );
-            None
+            RuntimeStateLoadResult::Invalid
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn load_runtime_state(path: &Path) -> Option<RuntimeOwnershipState> {
+    match load_runtime_state_result(path) {
+        RuntimeStateLoadResult::Loaded(state) => Some(state),
+        RuntimeStateLoadResult::Missing | RuntimeStateLoadResult::Invalid => None,
     }
 }
 
@@ -286,19 +305,23 @@ pub fn reconcile_startup_runtime_state(mut startup: crate::StartupState) -> crat
     match result {
         crate::process::RuntimeReconcileResult::RestoreRunning => {
             startup.restored_running = true;
+            startup.startup_message = Some(RUNTIME_RESTORED_MESSAGE.to_string());
         }
         crate::process::RuntimeReconcileResult::ClearStale => {
             if let Err(err) = clear_runtime_state(runtime_path) {
                 eprintln!("failed to clear stale runtime state: {err}");
             }
-            startup.runtime_state_path = None;
             startup.runtime_ownership = None;
             startup.restored_running = false;
+            startup.startup_message = Some(RUNTIME_STALE_CLEARED_MESSAGE.to_string());
         }
         crate::process::RuntimeReconcileResult::IgnoreInvalid => {
-            startup.runtime_state_path = None;
+            if let Err(err) = clear_runtime_state(runtime_path) {
+                eprintln!("failed to clear invalid runtime state: {err}");
+            }
             startup.runtime_ownership = None;
             startup.restored_running = false;
+            startup.startup_message = Some(RUNTIME_INVALID_CLEARED_MESSAGE.to_string());
         }
     }
 

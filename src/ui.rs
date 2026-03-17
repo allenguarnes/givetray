@@ -552,7 +552,10 @@ pub(crate) fn setup_menu_polling(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiE
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             let id = event.id;
             if id == "start-stop" {
-                let running = state.borrow().child.is_some();
+                let running = {
+                    let state = state.borrow();
+                    state.child.is_some() || state.owned_pgid.is_some()
+                };
                 if running {
                     stop_command(state.clone(), ui_tx.clone());
                 } else {
@@ -662,15 +665,29 @@ pub(crate) fn install_css() {
     }
 }
 
+pub(crate) fn should_emit_process_exited(
+    has_tracked_process: bool,
+    child_done: bool,
+    group_gone: bool,
+    exit_already_reported: bool,
+) -> bool {
+    has_tracked_process && child_done && group_gone && !exit_already_reported
+}
+
 pub(crate) fn setup_process_watcher(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>) {
     glib::timeout_add_local(Duration::from_millis(500), move || {
-        let mut should_emit = None;
+        let mut exit_code: Option<i32> = None;
+        let mut has_tracked_process = false;
+        let exit_already_reported;
         {
             let mut state = state.borrow_mut();
+            exit_already_reported = state.process_exit_reported;
+
             if let Some(child) = state.child.as_mut() {
+                has_tracked_process = true;
                 match child.try_wait() {
                     Ok(Some(status)) => {
-                        should_emit = Some(status.code());
+                        exit_code = status.code();
                         state.child = None;
                     }
                     Ok(None) => {}
@@ -679,10 +696,28 @@ pub(crate) fn setup_process_watcher(state: Rc<RefCell<AppState>>, ui_tx: Sender<
                     }
                 }
             }
+
+            if let Some(pgid) = state.owned_pgid {
+                has_tracked_process = true;
+                if !crate::process::is_process_group_alive(pgid) {
+                    state.owned_pgid = None;
+                    state.owned_pid = None;
+                }
+            }
         }
 
-        if let Some(code) = should_emit {
-            let _ = ui_tx.send_blocking(UiEvent::ProcessExited(code));
+        if has_tracked_process {
+            let state = state.borrow();
+            let child_done = state.child.is_none();
+            let group_gone = state.owned_pgid.is_none();
+            if should_emit_process_exited(
+                has_tracked_process,
+                child_done,
+                group_gone,
+                exit_already_reported,
+            ) {
+                let _ = ui_tx.send_blocking(UiEvent::ProcessExited(exit_code));
+            }
         }
 
         ControlFlow::Continue

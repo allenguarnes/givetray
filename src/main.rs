@@ -31,7 +31,8 @@ use std::rc::Rc;
 pub struct RuntimeOwnershipState {
     pub pid: u32,
     pub pgid: u32,
-    pub started_at_unix_ms: u64,
+    #[serde(alias = "started_at_unix_ms")]
+    pub started_at_clock_ticks: u64,
     pub command_label: String,
     pub profile_name: Option<String>,
     pub ephemeral: bool,
@@ -44,6 +45,9 @@ impl RuntimeOwnershipState {
         }
         if self.pgid == 0 {
             return Err("pgid must be greater than 0".to_string());
+        }
+        if self.started_at_clock_ticks == 0 {
+            return Err("started_at_clock_ticks must be greater than 0".to_string());
         }
         if self.command_label.len() > MAX_COMMAND_LENGTH {
             return Err(format!(
@@ -69,6 +73,11 @@ const BUNDLED_ICON_FILE_NAME: &str = "default-icon.png";
 const BG_CHILD_ENV: &str = "GIVETRAY_BG_CHILD";
 const LOG_LINK_TAG_NAME: &str = "log-link";
 const LOG_LINK_CLICK_SLOP: f64 = 4.0;
+const RUNTIME_RESTORED_MESSAGE: &str = "restored active run from previous session";
+const RUNTIME_STALE_CLEARED_MESSAGE: &str = "cleared stale runtime state from previous session";
+const RUNTIME_INVALID_CLEARED_MESSAGE: &str = "cleared invalid runtime state from previous session";
+const RUNTIME_STOP_FAILED_MESSAGE: &str =
+    "failed to stop managed process group; process may still be running";
 
 #[derive(Debug, Clone)]
 struct CliOptions {
@@ -141,6 +150,7 @@ struct AppState {
     child: Option<Child>,
     owned_pgid: Option<i32>,
     owned_pid: Option<u32>,
+    process_exit_reported: bool,
     runtime_state_path: Option<PathBuf>,
     restored_running: bool,
     log_lines: VecDeque<String>,
@@ -201,12 +211,25 @@ struct StartupState {
     runtime_state_path: Option<PathBuf>,
     runtime_ownership: Option<RuntimeOwnershipState>,
     restored_running: bool,
+    startup_message: Option<String>,
 }
 
 enum ConfigCloseAction {
     Save,
     Discard,
     Cancel,
+}
+
+fn initial_start_stop_label(restored_running: bool) -> &'static str {
+    if restored_running {
+        "Stop"
+    } else {
+        "Start"
+    }
+}
+
+fn should_launch_on_startup(startup: &StartupState) -> bool {
+    startup.launch_on_startup && !startup.restored_running
 }
 
 fn main() {
@@ -297,7 +320,12 @@ fn main() {
     let about_id = MenuId::new("about");
     let exit_id = MenuId::new("exit");
 
-    let start_stop_item = MenuItem::with_id(start_stop_id.clone(), "Start", true, None);
+    let start_stop_item = MenuItem::with_id(
+        start_stop_id.clone(),
+        initial_start_stop_label(startup.restored_running),
+        true,
+        None,
+    );
     let logs_item = MenuItem::with_id(logs_id.clone(), "Logs", true, None);
     let configure_item = MenuItem::with_id(configure_id.clone(), "Configuration", true, None);
     let about_item = MenuItem::with_id(about_id.clone(), "About", true, None);
@@ -321,6 +349,8 @@ fn main() {
 
     let tray_icon = load_tray_icon(&startup.config).expect("failed to load tray icon");
     let tooltip = tray_tooltip(&cli.run_target);
+    let should_launch = should_launch_on_startup(&startup);
+    let startup_message = startup.startup_message.clone();
     let _tray = TrayIconBuilder::new()
         .with_menu(Box::new(tray_menu))
         .with_tooltip(&tooltip)
@@ -339,6 +369,7 @@ fn main() {
         child: None,
         owned_pgid: startup.runtime_ownership.as_ref().map(|o| o.pgid as i32),
         owned_pid: startup.runtime_ownership.as_ref().map(|o| o.pid),
+        process_exit_reported: false,
         runtime_state_path: startup.runtime_state_path,
         restored_running: startup.restored_running,
         log_lines: VecDeque::new(),
@@ -370,6 +401,10 @@ fn main() {
         start_stop_item,
     }));
 
+    if let Some(message) = startup_message {
+        logs::append_log(&mut state.borrow_mut(), message);
+    }
+
     if state.borrow().persistent_config_access.is_some() {
         let (apps_toggle, system_autostart_toggle) = {
             let app = state.borrow();
@@ -386,7 +421,7 @@ fn main() {
     setup_menu_polling(state.clone(), ui_tx.clone());
     setup_process_watcher(state.clone(), ui_tx.clone());
 
-    if startup.launch_on_startup {
+    if should_launch {
         start_command(state.clone(), ui_tx);
     }
 

@@ -1,4 +1,7 @@
-use crate::{config::save_runtime_state, AppState, RuntimeOwnershipState, UiEvent, BG_CHILD_ENV};
+use crate::{
+    config::clear_runtime_state, config::save_runtime_state, AppState, RuntimeOwnershipState,
+    UiEvent, BG_CHILD_ENV, RUNTIME_STOP_FAILED_MESSAGE,
+};
 use async_channel::Sender;
 use gtk::prelude::*;
 use std::cell::RefCell;
@@ -7,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,6 +18,20 @@ pub enum RuntimeReconcileResult {
     RestoreRunning,
     ClearStale,
     IgnoreInvalid,
+}
+
+pub(crate) fn parse_process_start_time_from_stat(stat: &str) -> Option<u64> {
+    let after_comm = stat.rsplit(") ").next()?;
+    after_comm
+        .split_whitespace()
+        .nth(19)
+        .and_then(|s| s.parse::<u64>().ok())
+}
+
+pub fn get_process_start_time(pid: libc::pid_t) -> Option<u64> {
+    let stat_path = format!("/proc/{}/stat", pid);
+    let content = std::fs::read_to_string(&stat_path).ok()?;
+    parse_process_start_time_from_stat(&content)
 }
 
 pub fn reconcile_runtime_state<F>(
@@ -28,6 +45,31 @@ where
         return RuntimeReconcileResult::IgnoreInvalid;
     }
 
+    let pid = state.pid as libc::pid_t;
+    let saved_pgid = state.pgid as i32;
+    let saved_start_time = state.started_at_clock_ticks;
+
+    // Validate that the specific leader process still exists and belongs to the saved PGID
+    if unsafe { libc::getpgid(pid) } != saved_pgid {
+        return RuntimeReconcileResult::ClearStale;
+    }
+
+    // Validate the start time to protect against PID reuse.
+    // Old runtime-state files used unix milliseconds (very large numbers like 1700000000000+).
+    // New format uses clock ticks (much smaller numbers, typically millions).
+    // If the value is > 1 trillion, it's likely an old unix timestamp format - skip start time
+    // validation but still validate PGID membership above.
+    const UNIX_MS_THRESHOLD: u64 = 1_000_000_000_000; // 1 trillion
+    if saved_start_time > UNIX_MS_THRESHOLD {
+        // Old format: skip start time validation, rely on PGID check above
+    } else if let Some(current_start_time) = get_process_start_time(pid) {
+        if current_start_time != saved_start_time {
+            return RuntimeReconcileResult::ClearStale;
+        }
+    } else {
+        return RuntimeReconcileResult::ClearStale;
+    }
+
     if is_group_alive(state.pgid as i32) {
         RuntimeReconcileResult::RestoreRunning
     } else {
@@ -36,7 +78,13 @@ where
 }
 
 pub fn is_process_group_alive(pgid: i32) -> bool {
-    unsafe { libc::kill(pgid, 0) == 0 }
+    if pgid <= 0 {
+        return false;
+    }
+    unsafe {
+        let result = libc::kill(-pgid, 0);
+        result == 0 || (result == -1 && *libc::__errno_location() == libc::EPERM)
+    }
 }
 
 pub fn stop_process_group(pgid: i32, timeout: Duration) -> bool {
@@ -44,8 +92,9 @@ pub fn stop_process_group(pgid: i32, timeout: Duration) -> bool {
         return false;
     }
 
+    // If the process group is already gone, that's success - nothing to stop
     if !is_process_group_alive(pgid) {
-        return false;
+        return true;
     }
 
     if !kill_process_group_members(pgid, libc::SIGTERM) {
@@ -74,18 +123,37 @@ pub fn stop_process_group(pgid: i32, timeout: Duration) -> bool {
 }
 
 fn kill_process_group_members(pgid: i32, signal: libc::c_int) -> bool {
-    let pids = get_process_group_pids(pgid);
-    if pids.is_empty() {
-        return unsafe { libc::kill(-pgid, signal) == 0 };
+    // Primary: use kill(-pgid, signal) to signal the entire process group atomically
+    let result = unsafe { libc::kill(-pgid, signal) };
+
+    if result == 0 {
+        return true;
     }
 
+    // Check errno - if ESRCH (no such process), the group already exited, treat as success
+    let err = unsafe { *libc::__errno_location() };
+    if err == libc::ESRCH {
+        // Group already gone - either it exited between our check and kill,
+        // or was never valid. Either way, stop "succeeded".
+        return true;
+    }
+
+    // If kill to negative PGID failed with other error, fall back to per-PID iteration
+    // This handles edge cases where the group signaling might not work
+    let pids = get_process_group_pids(pgid);
+    if pids.is_empty() {
+        return false;
+    }
+
+    let mut any_succeeded = false;
     for pid in pids {
-        unsafe {
-            libc::kill(pid, signal);
+        let pid_result = unsafe { libc::kill(pid, signal) };
+        if pid_result == 0 {
+            any_succeeded = true;
         }
     }
 
-    true
+    any_succeeded
 }
 
 fn get_process_group_pids(pgid: i32) -> Vec<libc::pid_t> {
@@ -140,7 +208,7 @@ pub fn spawn_command_in_new_process_group(
         });
     }
 
-    let mut child = cmd
+    let child = cmd
         .spawn()
         .map_err(|err| format!("failed to start command: {err}"))?;
 
@@ -165,19 +233,41 @@ pub fn persist_launch_metadata(
     profile_name: Option<&str>,
     ephemeral: bool,
 ) -> Result<(), String> {
+    persist_launch_metadata_with_start_time(
+        runtime_state_path,
+        command,
+        owned_pid,
+        owned_pgid,
+        profile_name,
+        ephemeral,
+        None,
+    )
+}
+
+pub fn persist_launch_metadata_with_start_time(
+    runtime_state_path: &Option<PathBuf>,
+    command: &str,
+    owned_pid: u32,
+    owned_pgid: i32,
+    profile_name: Option<&str>,
+    ephemeral: bool,
+    start_time_override: Option<u64>,
+) -> Result<(), String> {
     let runtime_state_path = runtime_state_path
         .as_ref()
         .ok_or("runtime state path not set")?;
 
-    let started_at_unix_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| "system time before epoch")?
-        .as_millis() as u64;
+    let started_at_clock_ticks = if let Some(st) = start_time_override {
+        st
+    } else {
+        get_process_start_time(owned_pid as libc::pid_t)
+            .ok_or("failed to get process start time")?
+    };
 
     let state = RuntimeOwnershipState {
         pid: owned_pid,
         pgid: owned_pgid as u32,
-        started_at_unix_ms,
+        started_at_clock_ticks,
         command_label: command.to_string(),
         profile_name: profile_name.map(String::from),
         ephemeral,
@@ -280,6 +370,7 @@ pub(crate) fn start_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>
     state.borrow_mut().child = Some(spawn_result.child);
     state.borrow_mut().owned_pid = Some(spawn_result.owned_pid);
     state.borrow_mut().owned_pgid = Some(spawn_result.owned_pgid);
+    state.borrow_mut().process_exit_reported = false;
 
     let _ = ui_tx.send_blocking(UiEvent::SetRunning(true));
     let _ = ui_tx.send_blocking(UiEvent::AppendLog("command started".to_string()));
@@ -296,9 +387,8 @@ pub(crate) fn stop_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>)
                 let _ = ui_tx.send_blocking(UiEvent::ClearRuntimeState);
                 let _ = ui_tx.send_blocking(UiEvent::ProcessExited(None));
             } else {
-                let _ = ui_tx.send_blocking(UiEvent::AppendLog(
-                    "failed to stop process group, process may still be running".to_string(),
-                ));
+                let _ = ui_tx
+                    .send_blocking(UiEvent::AppendLog(RUNTIME_STOP_FAILED_MESSAGE.to_string()));
             }
         });
     } else if state.borrow().child.is_some() {
@@ -314,15 +404,20 @@ pub(crate) fn stop_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>)
 
 pub(crate) fn stop_command_blocking(state: Rc<RefCell<AppState>>) {
     let pgid = state.borrow().owned_pgid;
+    let runtime_state_path = state.borrow().runtime_state_path.clone();
 
     if let Some(pgid) = pgid {
         let stopped = stop_process_group(pgid, Duration::from_secs(2));
 
         if stopped {
+            if let Some(ref path) = runtime_state_path {
+                let _ = clear_runtime_state(path);
+            }
             state.borrow_mut().owned_pgid = None;
+            state.borrow_mut().owned_pid = None;
             state.borrow_mut().child = None;
         } else {
-            eprintln!("failed to stop process group");
+            eprintln!("{RUNTIME_STOP_FAILED_MESSAGE}");
         }
     } else if state.borrow().child.is_some() {
         let mut child = state.borrow_mut().child.take();

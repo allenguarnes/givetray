@@ -98,6 +98,7 @@ Ephemeral mode is temporary and profile-free, so desktop files and saved configu
 ### Tray Menu
 
 - `Start/Stop`: run or stop the configured command
+- `Stop` targets the managed process group, so child processes launched by the command are stopped with it when possible
 - `Logs`: open live log window
 - `Configuration`: edit profile command and toggles in persistent profile mode only
 - `About`: show app info and links
@@ -109,6 +110,14 @@ Ephemeral mode is temporary and profile-free, so desktop files and saved configu
 - Rolling in-memory buffer with line count
 - `Copy All` and `Clear` actions
 - Optional file logging per profile
+- Startup recovery messages when a managed run is restored or stale runtime state is cleared
+
+### Runtime Recovery
+
+- `givetray` writes a small runtime-state file for commands it launches itself
+- On relaunch, it restores `running` state when the recorded managed process group is still alive
+- If the recorded process group is gone or invalid, `givetray` clears the stale runtime-state automatically and starts in `stopped`
+- Recovery is conservative and only applies to runs that `givetray` created and tracked
 
 ### Configuration Window
 
