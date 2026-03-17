@@ -196,7 +196,7 @@ pub(crate) fn build_startup_state(cli: &CliOptions) -> Result<StartupState, Stri
                 runtime_state_path,
                 runtime_ownership,
                 restored_running: false,
-                owns_profile_lock: true,
+                owns_profile_lock: false,
                 profile_lock: None,
                 startup_message,
             })

@@ -482,6 +482,36 @@ fn startup_state_can_mark_profile_lock_conflict() {
 }
 
 #[test]
+fn startup_state_default_owns_profile_lock_for_persistent_profile() {
+    let _env_lock = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let temp_root = unique_test_dir("startup-state-persistent-lock-ownership");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let cli = parse_cli_args_from(["givetray", "-c", "default"])
+        .expect("persistent profile mode should parse");
+    let startup = build_startup_state(&cli).expect("persistent startup should build");
+
+    assert!(startup.owns_profile_lock);
+    assert!(startup.profile_lock.is_none());
+}
+
+#[test]
+fn startup_state_ephemeral_owns_no_profile_lock() {
+    let _env_lock = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let temp_root = unique_test_dir("startup-state-ephemeral-lock-ownership");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let cli = parse_cli_args_from(["givetray", "--", "echo", "hello"])
+        .expect("ephemeral mode should parse");
+    let startup = build_startup_state(&cli).expect("ephemeral startup should build");
+
+    assert!(!startup.owns_profile_lock);
+    assert!(startup.profile_lock.is_none());
+}
+
+#[test]
 fn persistent_configuration_access_source_of_truth_requires_profile_and_config_path() {
     assert!(persistent_config_access(
         Some("default".to_string()),
