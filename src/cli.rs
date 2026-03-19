@@ -18,7 +18,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub(crate) fn detach_to_background_if_needed(cli: &CliOptions) -> Result<(), String> {
     if env::var_os(BG_CHILD_ENV).is_some() {
@@ -56,9 +56,17 @@ pub(crate) fn detach_to_background_if_needed(cli: &CliOptions) -> Result<(), Str
         .spawn()
         .map_err(|err| format!("unable to spawn detached process: {err}"))?;
 
-    thread::sleep(Duration::from_millis(500));
-    if let Ok(Some(status)) = child.try_wait() {
-        return Err(format!("detached process exited early: {status}"));
+    // This is a startup heuristic, not a full parent/child readiness handshake.
+    // It catches immediate startup failures, but failures after this window remain
+    // the detached child's responsibility to report via its own logging path.
+    let startup_timeout = Duration::from_millis(1_000);
+    let poll_interval = Duration::from_millis(50);
+    let start = Instant::now();
+    while start.elapsed() < startup_timeout {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(format!("detached process exited early: {status}"));
+        }
+        thread::sleep(poll_interval);
     }
 
     process::exit(0);
