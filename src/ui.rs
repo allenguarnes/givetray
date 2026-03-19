@@ -284,14 +284,16 @@ pub(crate) fn setup_config_handlers(state: Rc<RefCell<AppState>>) {
 
         match show_config_close_dialog(window) {
             ConfigCloseAction::Save => {
-                save_from_config_widgets(
+                let save_succeeded = save_from_config_widgets(
                     state_close.clone(),
                     &buffer_close,
                     &log_to_file_toggle_close,
                     &apps_toggle_close,
                     &system_autostart_toggle_close,
                 );
-                window.hide();
+                if save_succeeded {
+                    window.hide();
+                }
             }
             ConfigCloseAction::Discard => {
                 refresh_config_dirty_status(state_close.clone());
@@ -459,7 +461,7 @@ fn save_from_config_widgets(
     log_to_file_toggle: &gtk::CheckButton,
     apps_toggle: &gtk::CheckButton,
     system_autostart_toggle: &gtk::CheckButton,
-) {
+) -> bool {
     let text = buffer_text(buffer);
     let saved = save_configuration(state.clone(), text, log_to_file_toggle.is_active());
     if saved {
@@ -471,6 +473,7 @@ fn save_from_config_widgets(
         refresh_desktop_toggles(state.clone(), apps_toggle, system_autostart_toggle);
     }
     refresh_config_dirty_status(state);
+    saved
 }
 
 fn config_has_unsaved_changes(

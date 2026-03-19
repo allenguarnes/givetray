@@ -257,7 +257,7 @@ pub(crate) fn save_configuration(
     let text = match validate_saved_command_text(&text) {
         Ok(command) => command,
         Err(err) => {
-            append_log(&mut state, format!("Invalid command: {err}"));
+            append_log(&mut state, err);
             return false;
         }
     };

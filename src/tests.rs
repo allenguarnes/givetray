@@ -9,7 +9,7 @@ use crate::config::{
     acquire_profile_lock, atomic_write, can_save_profile_configuration, clear_runtime_state,
     load_runtime_state, profile_lock_path_for_profile, reconcile_startup_runtime_state,
     runtime_state_path_for_ephemeral, runtime_state_path_for_profile, save_config,
-    save_runtime_state, validate_saved_command_text,
+    save_configuration, save_runtime_state, validate_saved_command_text,
 };
 use crate::logs::{
     append_log_to_file, clear_runtime_state_after_exit, extract_log_links,
@@ -25,12 +25,100 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::Mutex;
+use std::sync::{Mutex, Once};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
+static GTK_INIT: Once = Once::new();
+
+fn ensure_gtk_initialized() {
+    GTK_INIT.call_once(|| {
+        gtk::init().expect("gtk should initialize for ui-backed tests");
+    });
+}
+
+fn build_save_test_state(temp_root: &Path) -> Rc<RefCell<AppState>> {
+    ensure_gtk_initialized();
+
+    let profile = "save-test";
+    let config_path = temp_root.join("config").join("save-test.toml");
+    let (
+        logs_window,
+        logs_view,
+        logs_buffer,
+        logs_clear_button,
+        logs_copy_button,
+        logs_status_label,
+    ) = crate::logs::build_logs_window();
+    let (
+        config_window,
+        config_view,
+        config_buffer,
+        config_autostart,
+        config_log_to_file,
+        config_applications,
+        config_system_autostart,
+        config_save_button,
+        config_status_label,
+    ) = crate::ui::build_config_window(profile, "echo ready", false, false);
+    let about_window = crate::ui::build_about_window(None);
+    let start_stop_item = tray_icon::menu::MenuItem::with_id(
+        tray_icon::menu::MenuId::new("test-start-stop"),
+        "Start",
+        true,
+        None,
+    );
+
+    Rc::new(RefCell::new(AppState {
+        persistent_config_access: Some(PersistentConfigAccess {
+            profile: profile.to_string(),
+            config_path,
+        }),
+        command: "echo ready".to_string(),
+        saved_command: "echo ready".to_string(),
+        saved_autostart: false,
+        saved_icon_path: None,
+        saved_log_to_file: false,
+        saved_log_file_path: None,
+        child: None,
+        owned_pgid: None,
+        owned_pid: None,
+        process_exit_reported: false,
+        runtime_state_path: None,
+        restored_running: false,
+        owns_profile_lock: true,
+        profile_lock: None,
+        log_lines: VecDeque::new(),
+        log_links: VecDeque::new(),
+        log_file_path: None,
+        log_file_writer: None,
+        logs_window,
+        logs_view,
+        logs_buffer,
+        logs_clear_button,
+        logs_copy_button,
+        logs_status_label,
+        about_window,
+        config_window,
+        config_view,
+        config_buffer,
+        config_autostart,
+        config_log_to_file,
+        config_applications,
+        config_system_autostart,
+        config_save_button,
+        config_status_label,
+        config_saved_applications: false,
+        config_saved_system_autostart: false,
+        config_undo: Vec::new(),
+        config_redo: Vec::new(),
+        config_last: "echo ready".to_string(),
+        config_ignore: false,
+        start_stop_item,
+    }))
+}
 
 struct TestEnvGuard {
     home: Option<String>,
@@ -166,6 +254,27 @@ fn save_configuration_rejects_unparseable_command() {
 }
 
 #[test]
+fn save_configuration_returns_false_for_invalid_command() {
+    let _env_lock = ENV_LOCK.lock().expect("env lock should be acquired");
+    let temp_root = unique_test_dir("save-configuration-invalid-command");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+    let state = build_save_test_state(&temp_root);
+
+    let saved = save_configuration(state.clone(), "unterminated '".to_string(), false);
+    assert!(!saved);
+
+    let state_ref = state.borrow();
+    let last_log = state_ref
+        .log_lines
+        .back()
+        .expect("save failure should append a log line");
+    assert!(last_log.contains("invalid command:"));
+    assert!(!last_log.contains("Invalid command: invalid command:"));
+    assert_eq!(state_ref.saved_command, "echo ready");
+}
+
+#[test]
 fn reject_empty_ephemeral_mode() {
     let err = parse_cli_args_from(["givetray", "--"]).expect_err("empty ephemeral mode must fail");
 
@@ -195,6 +304,14 @@ fn reject_profile_only_flags_in_ephemeral_mode() {
 
     assert!(err.contains("ephemeral mode"));
     assert!(err.contains("--log-file"));
+}
+
+#[test]
+fn cli_rejects_invalid_command_override() {
+    let err = parse_cli_args_from(["givetray", "-c", "test", "--command", "unterminated '"])
+        .expect_err("invalid command override must fail");
+
+    assert!(err.contains("invalid"));
 }
 
 #[test]
