@@ -84,6 +84,16 @@ givetray desktop-file -c scrcpy --autostart
 When `-cmd/--command` is provided, the profile's saved command is overwritten.
 Ephemeral mode is temporary and profile-free, so desktop files and saved configuration do not apply even though the tray can still `Start/Stop` the active command.
 
+### Single-Instance Persistent Profiles
+
+Persistent profile mode (`-c PROFILE`) uses advisory locking to ensure only one instance can own a profile at a time. If you launch a second `givetray -c <profile>` while another instance is already running that profile:
+
+- The second instance starts as a non-owning session
+- Start/Stop and configuration saving are disabled
+- The startup message `profile already open` indicates this
+
+To make changes, close the first instance or use a different profile name.
+
 ## Desktop Entries
 
 - Desktop filename format: `givetray_<profile>.desktop`
@@ -107,7 +117,9 @@ Ephemeral mode is temporary and profile-free, so desktop files and saved configu
 ### Logs Window
 
 - Live stdout/stderr streaming
-- Rolling in-memory buffer with line count
+- Rolling history of command output
+- Bounded log queue to prevent memory growth
+- Under heavy log load, dropped lines are summarized in one coalesced message
 - `Copy All` and `Clear` actions
 - Optional file logging per profile
 - Startup recovery messages when a managed run is restored or stale runtime state is cleared
@@ -128,10 +140,27 @@ Ephemeral mode is temporary and profile-free, so desktop files and saved configu
 - Session autostart toggle
 - Saved/unsaved status with close confirmation
 
+When saving configuration, commands are validated for:
+
+- Non-empty text
+- Length within limits
+- Valid shell syntax
+
+Invalid commands are rejected with an error message.
+
+### Atomic Writes
+
+Configuration, runtime state, and desktop files are written atomically to prevent corruption from crashes or power loss.
+
 ## Sudo Behavior
 
-If the configured command starts with `sudo`, `givetray` prompts for password on each Start.
-The password is passed to `sudo` via stdin (`sudo -S`) and is not stored in config.
+Password prompting is mode-aware when the configured command starts with `sudo`:
+
+- Plain `sudo` prompts for password via GTK dialog
+- `sudo -n`, `sudo -A`, `sudo --askpass` skip the password prompt
+- `sudo -S`, `sudo --stdin` reads from stdin and does not prompt
+
+Passwords are never stored in config.
 
 ## Contributing
 
