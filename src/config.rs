@@ -2,7 +2,7 @@ use crate::desktop::copy_icon_to_profile;
 use crate::logs::{append_log, profile_lock_action_blocked_message};
 use crate::{
     AppState, CliOptions, Config, RuntimeOwnershipState, APP_NAME, DEFAULT_COMMAND,
-    DEFAULT_PROFILE, RUNTIME_INVALID_CLEARED_MESSAGE, RUNTIME_RESTORED_MESSAGE,
+    DEFAULT_PROFILE, MAX_COMMAND_LENGTH, RUNTIME_INVALID_CLEARED_MESSAGE, RUNTIME_RESTORED_MESSAGE,
     RUNTIME_STALE_CLEARED_MESSAGE,
 };
 use directories::ProjectDirs;
@@ -168,6 +168,27 @@ pub(crate) fn sanitize_profile_name(profile: &str) -> String {
     cleaned
 }
 
+pub(crate) fn validate_saved_command_text(raw: &str) -> Result<String, String> {
+    let command = raw.trim();
+    if command.is_empty() {
+        return Err("command cannot be empty".to_string());
+    }
+    if command.len() > MAX_COMMAND_LENGTH {
+        return Err(format!(
+            "command is too long (max {MAX_COMMAND_LENGTH} characters)"
+        ));
+    }
+    if command.contains('\0') {
+        return Err("command contains invalid null bytes".to_string());
+    }
+
+    match shell_words::split(command) {
+        Ok(parts) if !parts.is_empty() => Ok(command.to_string()),
+        Ok(_) => Err("command cannot be empty".to_string()),
+        Err(err) => Err(format!("invalid command: {err}")),
+    }
+}
+
 pub(crate) fn apply_cli_overrides_to_config(
     config: &mut Config,
     cli: &CliOptions,
@@ -232,6 +253,13 @@ pub(crate) fn save_configuration(
             "configuration save is unavailable in ephemeral mode".to_string(),
         );
         return false;
+    };
+    let text = match validate_saved_command_text(&text) {
+        Ok(command) => command,
+        Err(err) => {
+            append_log(&mut state, format!("Invalid command: {err}"));
+            return false;
+        }
     };
     let new_autostart = state.config_autostart.is_active();
     let mut new_log_file_path = state.saved_log_file_path.clone();

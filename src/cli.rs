@@ -2,11 +2,12 @@ use crate::config::{
     acquire_profile_lock, apply_cli_overrides_to_config, clear_runtime_state,
     config_path_for_profile, load_or_create_config, load_runtime_state_result,
     profile_lock_path_for_profile, resolve_log_file_path, runtime_state_path_for_ephemeral,
-    runtime_state_path_for_profile, save_config, RuntimeStateLoadResult,
+    runtime_state_path_for_profile, save_config, validate_saved_command_text,
+    RuntimeStateLoadResult,
 };
 use crate::{
     CliMode, CliOptions, CliRequest, CliRunTarget, Config, PersistentConfigAccess, StartupState,
-    APP_NAME, BG_CHILD_ENV, MAX_COMMAND_LENGTH, MAX_PROFILE_LENGTH, RUNTIME_ALREADY_OPEN_MESSAGE,
+    APP_NAME, BG_CHILD_ENV, MAX_PROFILE_LENGTH, RUNTIME_ALREADY_OPEN_MESSAGE,
     RUNTIME_INVALID_CLEARED_MESSAGE,
 };
 use std::env;
@@ -681,22 +682,11 @@ fn validate_profile_name(raw: &str) -> Result<String, String> {
 }
 
 fn validate_command_override(raw: &str) -> Result<String, String> {
-    let command = raw.trim();
-    if command.is_empty() {
-        return Err("command cannot be empty".to_string());
-    }
-    if command.len() > MAX_COMMAND_LENGTH {
-        return Err(format!(
-            "command is too long (max {MAX_COMMAND_LENGTH} characters)"
-        ));
-    }
-    if command.contains('\0') {
-        return Err("command contains invalid null bytes".to_string());
-    }
-
-    match shell_words::split(command) {
-        Ok(parts) if !parts.is_empty() => Ok(command.to_string()),
-        Ok(_) => Err("command cannot be empty".to_string()),
-        Err(err) => Err(format!("invalid -cmd/--command value: {err}")),
+    match validate_saved_command_text(raw) {
+        Ok(command) => Ok(command),
+        Err(err) if err.starts_with("invalid command: ") => {
+            Err(err.replacen("invalid command: ", "invalid -cmd/--command value: ", 1))
+        }
+        Err(err) => Err(err),
     }
 }

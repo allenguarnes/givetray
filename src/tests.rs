@@ -9,7 +9,7 @@ use crate::config::{
     acquire_profile_lock, atomic_write, can_save_profile_configuration, clear_runtime_state,
     load_runtime_state, profile_lock_path_for_profile, reconcile_startup_runtime_state,
     runtime_state_path_for_ephemeral, runtime_state_path_for_profile, save_config,
-    save_runtime_state,
+    save_runtime_state, validate_saved_command_text,
 };
 use crate::logs::{
     append_log_to_file, clear_runtime_state_after_exit, extract_log_links,
@@ -153,6 +153,16 @@ fn parse_ephemeral_mode_passes_through_version_flag() {
         CliRunTarget::EphemeralArgv { ref argv }
             if argv == &["echo".to_string(), "--version".to_string()]
     ));
+}
+
+#[test]
+fn save_configuration_rejects_empty_command() {
+    assert!(!validate_saved_command_text("   ").is_ok());
+}
+
+#[test]
+fn save_configuration_rejects_unparseable_command() {
+    assert!(!validate_saved_command_text("unterminated '").is_ok());
 }
 
 #[test]
