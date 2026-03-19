@@ -342,16 +342,21 @@ pub(crate) fn start_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>
     };
 
     let sudo_password = if is_sudo_command(&args) {
-        ensure_sudo_stdin_flag(&mut args);
-        match prompt_sudo_password() {
-            Some(password) => Some(password),
-            None => {
-                let _ = try_send_main_thread_event(
-                    &ui_tx,
-                    UiEvent::AppendLog("sudo password prompt cancelled".to_string()),
-                );
-                return;
+        if sudo_mode_needs_prompt(&args) {
+            ensure_sudo_stdin_flag(&mut args);
+            match prompt_sudo_password() {
+                Some(password) => Some(password),
+                None => {
+                    let _ = try_send_main_thread_event(
+                        &ui_tx,
+                        UiEvent::AppendLog("sudo password prompt cancelled".to_string()),
+                    );
+                    return;
+                }
             }
+        } else {
+            ensure_sudo_stdin_flag(&mut args);
+            None
         }
     } else {
         None
@@ -524,6 +529,62 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(reader: R, ui_tx: Sender<UiEv
 
         flush_dropped_lines_blocking(&ui_tx, &mut dropped_lines);
     });
+}
+
+pub(crate) enum SudoMode {
+    Plain,
+    Stdin,
+    Askpass,
+    NonInteractive,
+}
+
+pub(crate) fn detect_sudo_mode(args: &[String]) -> Option<SudoMode> {
+    if args.is_empty() {
+        return None;
+    }
+
+    let first_arg = Path::new(&args[0]);
+    let file_name = first_arg.file_name().and_then(|n| n.to_str());
+    if file_name != Some("sudo") {
+        return None;
+    }
+
+    let mut i = 1;
+    while i < args.len() {
+        let arg = &args[i];
+        if let Some(mode) = parse_sudo_short_options(arg) {
+            return Some(mode);
+        }
+        if arg.as_str() == "--" {
+            break;
+        }
+        i += 1;
+    }
+
+    Some(SudoMode::Plain)
+}
+
+fn parse_sudo_short_options(arg: &str) -> Option<SudoMode> {
+    if !arg.starts_with('-') || arg.len() < 2 || arg.starts_with("--") {
+        return None;
+    }
+    for ch in arg.chars().skip(1) {
+        match ch {
+            'n' => return Some(SudoMode::NonInteractive),
+            'A' => return Some(SudoMode::Askpass),
+            'S' => return Some(SudoMode::Stdin),
+            _ => {}
+        }
+    }
+    None
+}
+
+pub(crate) fn sudo_mode_needs_prompt(args: &[String]) -> bool {
+    match detect_sudo_mode(args) {
+        Some(SudoMode::Plain) => true,
+        Some(SudoMode::Stdin) | Some(SudoMode::Askpass) | Some(SudoMode::NonInteractive) => false,
+        None => false,
+    }
 }
 
 fn is_sudo_command(args: &[String]) -> bool {
