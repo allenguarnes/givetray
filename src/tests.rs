@@ -987,6 +987,23 @@ fn atomic_write_replaces_existing_file_contents() {
     assert_eq!(read_back, new_contents);
 }
 
+#[test]
+fn atomic_write_creates_deeply_nested_missing_parent_directories() {
+    let temp_dir = unique_test_dir("atomic-write-nested-parents");
+    fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+    let file_path = temp_dir
+        .join("nested")
+        .join("profile")
+        .join("configs")
+        .join("settings.toml");
+
+    atomic_write(&file_path, "enabled = true\n").expect("atomic_write should succeed");
+
+    assert!(file_path.exists(), "atomic write should create target file");
+    let read_back = fs::read_to_string(&file_path).expect("should read file");
+    assert_eq!(read_back, "enabled = true\n");
+}
+
 #[cfg(unix)]
 #[test]
 fn atomic_write_preserves_existing_file_permissions() {

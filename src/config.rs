@@ -99,7 +99,12 @@ pub(crate) fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
     };
 
     fs::create_dir_all(parent).map_err(|err| format!("failed to create directory: {err}"))?;
+    // Durability note: we sync only `parent` after rename. If create_dir_all had to
+    // create missing ancestors on first run, those ancestor directory entries may not
+    // be individually synced to their own parents before a crash.
     let existing_permissions = path.metadata().ok().map(|metadata| metadata.permissions());
+    // Permission note: this preserves standard file permission bits via
+    // std::fs::Permissions, but not ownership, ACLs, or xattrs.
 
     let file_name = path
         .file_name()
