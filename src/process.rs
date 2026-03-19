@@ -342,21 +342,24 @@ pub(crate) fn start_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>
     };
 
     let sudo_password = if is_sudo_command(&args) {
-        if sudo_mode_needs_prompt(&args) {
-            ensure_sudo_stdin_flag(&mut args);
-            match prompt_sudo_password() {
-                Some(password) => Some(password),
-                None => {
-                    let _ = try_send_main_thread_event(
-                        &ui_tx,
-                        UiEvent::AppendLog("sudo password prompt cancelled".to_string()),
-                    );
-                    return;
+        match detect_sudo_mode(&args) {
+            Some(SudoMode::Plain) => {
+                ensure_sudo_stdin_flag(&mut args);
+                match prompt_sudo_password() {
+                    Some(password) => Some(password),
+                    None => {
+                        let _ = try_send_main_thread_event(
+                            &ui_tx,
+                            UiEvent::AppendLog("sudo password prompt cancelled".to_string()),
+                        );
+                        return;
+                    }
                 }
             }
-        } else {
-            ensure_sudo_stdin_flag(&mut args);
-            None
+            Some(SudoMode::Stdin) | Some(SudoMode::Askpass) | Some(SudoMode::NonInteractive) => {
+                None
+            }
+            None => None,
         }
     } else {
         None
@@ -552,11 +555,21 @@ pub(crate) fn detect_sudo_mode(args: &[String]) -> Option<SudoMode> {
     let mut i = 1;
     while i < args.len() {
         let arg = &args[i];
-        if let Some(mode) = parse_sudo_short_options(arg) {
-            return Some(mode);
-        }
-        if arg.as_str() == "--" {
+
+        if !arg.starts_with('-') {
             break;
+        }
+
+        match arg.as_str() {
+            "-n" | "--non-interactive" => return Some(SudoMode::NonInteractive),
+            "-A" | "--askpass" => return Some(SudoMode::Askpass),
+            "-S" | "--stdin" => return Some(SudoMode::Stdin),
+            "--" => break,
+            _ => {
+                if let Some(mode) = parse_sudo_short_options(arg) {
+                    return Some(mode);
+                }
+            }
         }
         i += 1;
     }
@@ -565,7 +578,7 @@ pub(crate) fn detect_sudo_mode(args: &[String]) -> Option<SudoMode> {
 }
 
 fn parse_sudo_short_options(arg: &str) -> Option<SudoMode> {
-    if !arg.starts_with('-') || arg.len() < 2 || arg.starts_with("--") {
+    if !arg.starts_with('-') || arg.len() < 2 {
         return None;
     }
     for ch in arg.chars().skip(1) {
@@ -579,14 +592,6 @@ fn parse_sudo_short_options(arg: &str) -> Option<SudoMode> {
     None
 }
 
-pub(crate) fn sudo_mode_needs_prompt(args: &[String]) -> bool {
-    match detect_sudo_mode(args) {
-        Some(SudoMode::Plain) => true,
-        Some(SudoMode::Stdin) | Some(SudoMode::Askpass) | Some(SudoMode::NonInteractive) => false,
-        None => false,
-    }
-}
-
 fn is_sudo_command(args: &[String]) -> bool {
     args.first()
         .and_then(|arg| Path::new(arg).file_name())
@@ -594,7 +599,7 @@ fn is_sudo_command(args: &[String]) -> bool {
         .is_some_and(|name| name == "sudo")
 }
 
-fn ensure_sudo_stdin_flag(args: &mut Vec<String>) {
+pub(crate) fn ensure_sudo_stdin_flag(args: &mut Vec<String>) {
     if args
         .iter()
         .any(|arg| arg == "-S" || arg == "--stdin" || arg == "--askpass")

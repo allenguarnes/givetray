@@ -1908,7 +1908,11 @@ mod stop_process_group {
 }
 
 mod sudo_mode_detection {
-    use crate::process::{detect_sudo_mode, sudo_mode_needs_prompt, SudoMode};
+    use crate::process::{detect_sudo_mode, SudoMode};
+
+    fn needs_password(args: &[String]) -> bool {
+        matches!(detect_sudo_mode(args), Some(SudoMode::Plain))
+    }
 
     #[test]
     fn sudo_askpass_mode_skips_stdin_injection() {
@@ -1920,19 +1924,19 @@ mod sudo_mode_detection {
     #[test]
     fn sudo_noninteractive_mode_skips_password_prompt() {
         let args = vec!["sudo".to_string(), "-n".to_string(), "echo".to_string()];
-        assert!(!sudo_mode_needs_prompt(&args));
+        assert!(!needs_password(&args));
     }
 
     #[test]
     fn sudo_plain_mode_needs_password() {
         let args = vec!["sudo".to_string(), "echo".to_string()];
-        assert!(sudo_mode_needs_prompt(&args));
+        assert!(needs_password(&args));
     }
 
     #[test]
     fn sudo_stdin_mode_skips_password_prompt() {
         let args = vec!["sudo".to_string(), "-S".to_string(), "echo".to_string()];
-        assert!(!sudo_mode_needs_prompt(&args));
+        assert!(!needs_password(&args));
     }
 
     #[test]
@@ -1950,18 +1954,143 @@ mod sudo_mode_detection {
     #[test]
     fn sudo_absolute_path_needs_password() {
         let args = vec!["/usr/bin/sudo".to_string(), "echo".to_string()];
-        assert!(sudo_mode_needs_prompt(&args));
+        assert!(needs_password(&args));
     }
 
     #[test]
     fn sudo_short_option_bundle_an() {
         let args = vec!["sudo".to_string(), "-An".to_string(), "echo".to_string()];
-        assert!(!sudo_mode_needs_prompt(&args));
+        assert!(!needs_password(&args));
     }
 
     #[test]
     fn sudo_short_option_bundle_sn() {
         let args = vec!["sudo".to_string(), "-Sn".to_string(), "echo".to_string()];
-        assert!(!sudo_mode_needs_prompt(&args));
+        assert!(!needs_password(&args));
+    }
+
+    #[test]
+    fn sudo_long_option_non_interactive_recognized() {
+        let args = vec![
+            "sudo".to_string(),
+            "--non-interactive".to_string(),
+            "echo".to_string(),
+        ];
+        let mode = detect_sudo_mode(&args);
+        assert!(matches!(mode, Some(SudoMode::NonInteractive)));
+        assert!(!needs_password(&args));
+    }
+
+    #[test]
+    fn sudo_long_option_askpass_recognized() {
+        let args = vec![
+            "sudo".to_string(),
+            "--askpass".to_string(),
+            "echo".to_string(),
+        ];
+        let mode = detect_sudo_mode(&args);
+        assert!(matches!(mode, Some(SudoMode::Askpass)));
+        assert!(!needs_password(&args));
+    }
+
+    #[test]
+    fn sudo_long_option_stdin_recognized() {
+        let args = vec![
+            "sudo".to_string(),
+            "--stdin".to_string(),
+            "echo".to_string(),
+        ];
+        let mode = detect_sudo_mode(&args);
+        assert!(matches!(mode, Some(SudoMode::Stdin)));
+        assert!(!needs_password(&args));
+    }
+
+    #[test]
+    fn sudo_stops_at_first_non_option() {
+        let args = vec![
+            "sudo".to_string(),
+            "-n".to_string(),
+            "--".to_string(),
+            "-n".to_string(),
+        ];
+        let mode = detect_sudo_mode(&args);
+        assert!(matches!(mode, Some(SudoMode::NonInteractive)));
+    }
+
+    #[test]
+    fn sudo_command_args_not_misclassified() {
+        let args = vec![
+            "sudo".to_string(),
+            "myapp".to_string(),
+            "-n".to_string(),
+            "--flag".to_string(),
+        ];
+        let mode = detect_sudo_mode(&args);
+        assert!(matches!(mode, Some(SudoMode::Plain)));
+        assert!(needs_password(&args));
+    }
+}
+
+mod sudo_stdin_injection {
+    use crate::process::ensure_sudo_stdin_flag;
+
+    fn has_stdin_flag(args: &[String]) -> bool {
+        args.iter().any(|arg| arg == "-S" || arg == "--stdin")
+    }
+
+    #[test]
+    fn plain_sudo_gets_s_injected() {
+        let mut args = vec!["sudo".to_string(), "echo".to_string()];
+        ensure_sudo_stdin_flag(&mut args);
+        assert!(has_stdin_flag(&args));
+        assert_eq!(args[0], "sudo");
+        assert_eq!(args[1], "-S");
+        assert_eq!(args[2], "echo");
+    }
+
+    #[test]
+    fn already_has_s_flag_not_duplicated() {
+        let mut args = vec!["sudo".to_string(), "-S".to_string(), "echo".to_string()];
+        ensure_sudo_stdin_flag(&mut args);
+        assert!(has_stdin_flag(&args));
+        assert_eq!(args[1], "-S");
+    }
+
+    #[test]
+    fn already_has_long_stdin_not_duplicated() {
+        let mut args = vec![
+            "sudo".to_string(),
+            "--stdin".to_string(),
+            "echo".to_string(),
+        ];
+        ensure_sudo_stdin_flag(&mut args);
+        assert!(has_stdin_flag(&args));
+        assert_eq!(args[1], "--stdin");
+    }
+
+    #[test]
+    fn already_has_askpass_not_duplicated() {
+        let mut args = vec![
+            "sudo".to_string(),
+            "--askpass".to_string(),
+            "echo".to_string(),
+        ];
+        ensure_sudo_stdin_flag(&mut args);
+        assert!(!has_stdin_flag(&args));
+    }
+
+    #[test]
+    fn bundled_option_sn_has_stdin() {
+        let mut args = vec!["sudo".to_string(), "-Sn".to_string(), "echo".to_string()];
+        ensure_sudo_stdin_flag(&mut args);
+        assert!(has_stdin_flag(&args));
+    }
+
+    #[test]
+    fn single_arg_sudo_gets_s_at_end() {
+        let mut args = vec!["sudo".to_string()];
+        ensure_sudo_stdin_flag(&mut args);
+        assert!(has_stdin_flag(&args));
+        assert_eq!(args[1], "-S");
     }
 }
