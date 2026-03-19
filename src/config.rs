@@ -99,6 +99,7 @@ pub(crate) fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
     };
 
     fs::create_dir_all(parent).map_err(|err| format!("failed to create directory: {err}"))?;
+    let existing_permissions = path.metadata().ok().map(|metadata| metadata.permissions());
 
     let file_name = path
         .file_name()
@@ -113,6 +114,10 @@ pub(crate) fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
     let write_result = (|| {
         let mut file = fs::File::create(&temp_path)
             .map_err(|err| format!("failed to create temp file: {err}"))?;
+        if let Some(permissions) = existing_permissions.as_ref() {
+            file.set_permissions(permissions.clone())
+                .map_err(|err| format!("failed to set temp file permissions: {err}"))?;
+        }
         file.write_all(contents.as_bytes())
             .map_err(|err| format!("failed to write temp file: {err}"))?;
         file.sync_all()
@@ -127,7 +132,17 @@ pub(crate) fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
     fs::rename(&temp_path, path).map_err(|err| {
         let _ = fs::remove_file(&temp_path);
         format!("failed to rename temp file: {err}")
-    })
+    })?;
+
+    sync_directory(parent)
+}
+
+fn sync_directory(path: &Path) -> Result<(), String> {
+    let directory =
+        fs::File::open(path).map_err(|err| format!("failed to open directory for sync: {err}"))?;
+    directory
+        .sync_all()
+        .map_err(|err| format!("failed to sync directory: {err}"))
 }
 
 pub(crate) fn sanitize_profile_name(profile: &str) -> String {

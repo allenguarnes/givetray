@@ -27,6 +27,9 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Mutex;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 struct TestEnvGuard {
@@ -982,6 +985,28 @@ fn atomic_write_replaces_existing_file_contents() {
 
     let read_back = fs::read_to_string(&file_path).expect("should read file");
     assert_eq!(read_back, new_contents);
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_write_preserves_existing_file_permissions() {
+    let temp_dir = unique_test_dir("atomic-write-permissions");
+    fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+    let file_path = temp_dir.join("secure.txt");
+
+    fs::write(&file_path, "old").expect("should create file");
+    let secure_mode = 0o600;
+    fs::set_permissions(&file_path, fs::Permissions::from_mode(secure_mode))
+        .expect("should set secure permissions");
+
+    atomic_write(&file_path, "new").expect("atomic_write should succeed");
+
+    let mode_after = fs::metadata(&file_path)
+        .expect("metadata should be readable")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode_after, secure_mode);
 }
 
 #[test]
