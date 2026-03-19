@@ -69,6 +69,10 @@ pub(crate) fn detach_to_background_if_needed(cli: &CliOptions) -> Result<(), Str
         thread::sleep(poll_interval);
     }
 
+    if let Ok(Some(status)) = child.try_wait() {
+        return Err(format!("detached process exited early: {status}"));
+    }
+
     process::exit(0);
 }
 
