@@ -7,10 +7,11 @@ use crate::config::{
 };
 use crate::{
     CliMode, CliOptions, CliRequest, CliRunTarget, Config, PersistentConfigAccess, StartupState,
-    APP_NAME, BG_CHILD_ENV, MAX_PROFILE_LENGTH, RUNTIME_ALREADY_OPEN_MESSAGE,
+    APP_NAME, BG_CHILD_ENV, DEFAULT_COMMAND, MAX_PROFILE_LENGTH, RUNTIME_ALREADY_OPEN_MESSAGE,
     RUNTIME_INVALID_CLEARED_MESSAGE,
 };
 use std::env;
+use std::fs;
 use std::io;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -154,19 +155,55 @@ pub(crate) struct PreflightState {
     config: Config,
 }
 
+fn acquire_profile_lock_for_startup(
+    profile: &str,
+) -> Result<(bool, Option<crate::config::ProfileLockHandle>), String> {
+    let lock_path = profile_lock_path_for_profile(profile);
+    match lock_path {
+        Some(ref path) => match acquire_profile_lock(path) {
+            Ok(handle) => Ok((true, Some(handle))),
+            Err(err) if err.contains("profile lock already held") => Ok((false, None)),
+            Err(err) => Err(err),
+        },
+        None => Ok((true, None)),
+    }
+}
+
+fn load_config_without_side_effects(path: &Path) -> Config {
+    let default = Config {
+        command: DEFAULT_COMMAND.to_string(),
+        autostart: false,
+        icon_path: None,
+        log_to_file: false,
+        log_file_path: None,
+    };
+
+    let content = match fs::read_to_string(path) {
+        Ok(data) => data,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return default,
+        Err(err) => {
+            eprintln!("failed to read config at {}: {err}", path.display());
+            return default;
+        }
+    };
+
+    match toml::from_str(&content) {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("failed to parse config at {}: {err}", path.display());
+            default
+        }
+    }
+}
+
 pub(crate) fn build_startup_state(cli: &CliOptions) -> Result<StartupState, String> {
     match &cli.run_target {
         CliRunTarget::PersistentProfile { profile } => {
-            let preflight = prepare_preflight_for_persistent_profile(profile, cli)?;
-
-            let lock_path = profile_lock_path_for_profile(profile);
-            let (owns_profile_lock, profile_lock) = match lock_path {
-                Some(ref path) => match acquire_profile_lock(path) {
-                    Ok(handle) => (true, Some(handle)),
-                    Err(err) if err.contains("profile lock already held") => (false, None),
-                    Err(err) => return Err(err),
-                },
-                None => (true, None),
+            let (owns_profile_lock, profile_lock) = acquire_profile_lock_for_startup(profile)?;
+            let preflight = if owns_profile_lock {
+                prepare_preflight_for_persistent_profile(profile, cli)?
+            } else {
+                prepare_readonly_preflight_for_persistent_profile(profile)?
             };
 
             complete_persistent_startup(preflight, owns_profile_lock, profile_lock)
@@ -207,6 +244,20 @@ pub(crate) fn prepare_preflight_for_persistent_profile(
         Ok(false) => {}
         Err(err) => return Err(format!("failed to apply CLI overrides: {err}")),
     }
+
+    Ok(PreflightState {
+        profile: profile.to_string(),
+        config_path,
+        config,
+    })
+}
+
+fn prepare_readonly_preflight_for_persistent_profile(
+    profile: &str,
+) -> Result<PreflightState, String> {
+    let config_path = config_path_for_profile(profile)
+        .ok_or_else(|| "failed to resolve configuration path".to_string())?;
+    let config = load_config_without_side_effects(&config_path);
 
     Ok(PreflightState {
         profile: profile.to_string(),
@@ -285,32 +336,21 @@ pub(crate) fn prepare_run_startup_with<F>(
 where
     F: FnOnce(&CliOptions) -> Result<(), String>,
 {
-    let preflight = match &cli.run_target {
+    match &cli.run_target {
         CliRunTarget::PersistentProfile { profile } => {
-            let preflight = prepare_preflight_for_persistent_profile(profile, cli)?;
             detach(cli).map_err(|err| format!("failed to start background instance: {err}"))?;
-            Some(preflight)
-        }
-        CliRunTarget::EphemeralArgv { .. } => {
-            detach(cli).map_err(|err| format!("failed to start background instance: {err}"))?;
-            None
-        }
-    };
-
-    match preflight {
-        Some(preflight) => {
-            let lock_path = profile_lock_path_for_profile(&preflight.profile);
-            let (owns_profile_lock, profile_lock) = match lock_path {
-                Some(ref path) => match acquire_profile_lock(path) {
-                    Ok(handle) => (true, Some(handle)),
-                    Err(err) if err.contains("profile lock already held") => (false, None),
-                    Err(err) => return Err(err),
-                },
-                None => (true, None),
+            let (owns_profile_lock, profile_lock) = acquire_profile_lock_for_startup(profile)?;
+            let preflight = if owns_profile_lock {
+                prepare_preflight_for_persistent_profile(profile, cli)?
+            } else {
+                prepare_readonly_preflight_for_persistent_profile(profile)?
             };
             complete_persistent_startup(preflight, owns_profile_lock, profile_lock)
         }
-        None => build_startup_state(cli),
+        CliRunTarget::EphemeralArgv { .. } => {
+            detach(cli).map_err(|err| format!("failed to start background instance: {err}"))?;
+            build_startup_state(cli)
+        }
     }
 }
 

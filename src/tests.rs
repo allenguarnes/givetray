@@ -11,6 +11,7 @@ use crate::config::{
     runtime_state_path_for_ephemeral, runtime_state_path_for_profile, save_config,
     save_configuration, save_runtime_state, validate_saved_command_text,
 };
+use crate::desktop::create_desktop_file_from_cli;
 use crate::logs::{
     append_log_to_file, clear_runtime_state_after_exit, extract_log_links,
     should_activate_log_link, strip_ansi_codes,
@@ -245,12 +246,12 @@ fn parse_ephemeral_mode_passes_through_version_flag() {
 
 #[test]
 fn save_configuration_rejects_empty_command() {
-    assert!(!validate_saved_command_text("   ").is_ok());
+    assert!(validate_saved_command_text("   ").is_err());
 }
 
 #[test]
 fn save_configuration_rejects_unparseable_command() {
-    assert!(!validate_saved_command_text("unterminated '").is_ok());
+    assert!(validate_saved_command_text("unterminated '").is_err());
 }
 
 #[test]
@@ -729,8 +730,8 @@ fn persistent_startup_state_exposes_configuration_from_source_of_truth() {
 }
 
 #[test]
-fn startup_preflight_runs_before_detach_for_persistent_profiles() {
-    let _env_lock = ENV_LOCK.lock().expect("env lock should be acquired");
+fn startup_preflight_runs_after_detach_for_persistent_profiles() {
+    let _env_lock = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
     let temp_root = unique_test_dir("startup-preflight-order");
     fs::create_dir_all(&temp_root).expect("temp root should be created");
     let _env = TestEnvGuard::set(&temp_root);
@@ -743,17 +744,104 @@ fn startup_preflight_runs_before_detach_for_persistent_profiles() {
             .persistent_profile()
             .expect("profile should still be persistent");
         let config_path = config_path_for_profile(profile).expect("config path should resolve");
-        let saved = fs::read_to_string(&config_path)
-            .expect("config should already be written before detach");
-
-        assert!(saved.contains("printf ready"));
+        assert!(!config_path.exists());
 
         Ok(())
     })
     .expect("startup preparation should succeed");
 
+    let config_path = config_path_for_profile("preflight").expect("config path should resolve");
+    let saved = fs::read_to_string(&config_path).expect("config should be written after detach");
+    assert!(saved.contains("printf ready"));
     assert_eq!(startup.config.command, "printf ready");
     assert!(startup.persistent_config_access.is_some());
+}
+
+#[test]
+fn startup_preflight_does_not_persist_cli_overrides_without_profile_lock() {
+    let _env_lock = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let temp_root = unique_test_dir("startup-preflight-lock-guard");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let profile = "preflight-locked";
+    let config_path = config_path_for_profile(profile).expect("config path should resolve");
+    save_config(
+        &config_path,
+        &Config {
+            command: "echo baseline".to_string(),
+            autostart: false,
+            icon_path: None,
+            log_to_file: false,
+            log_file_path: None,
+        },
+    )
+    .expect("baseline config should be saved");
+
+    let lock_path = profile_lock_path_for_profile(profile).expect("lock path should resolve");
+    let _lock = acquire_profile_lock(&lock_path).expect("lock should be acquired for test");
+
+    let cli = parse_cli_args_from(["givetray", "-c", profile, "--command", "printf changed"])
+        .expect("persistent cli should parse");
+
+    let startup = prepare_run_startup_with(&cli, |_| Ok(()))
+        .expect("startup preparation should still return non-owning startup state");
+
+    assert!(!startup.owns_profile_lock);
+    assert_eq!(
+        startup.startup_message.as_deref(),
+        Some(RUNTIME_ALREADY_OPEN_MESSAGE)
+    );
+    assert_eq!(startup.config.command, "echo baseline");
+
+    let saved = fs::read_to_string(&config_path).expect("config should remain readable");
+    assert!(saved.contains("echo baseline"));
+    assert!(!saved.contains("printf changed"));
+}
+
+#[test]
+fn desktop_file_creation_requires_profile_lock_before_persisting_overrides() {
+    let _env_lock = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let temp_root = unique_test_dir("desktop-file-lock-guard");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let output_dir = temp_root.join("desktop");
+    fs::create_dir_all(&output_dir).expect("output dir should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let profile = "desktop-locked";
+    let config_path = config_path_for_profile(profile).expect("config path should resolve");
+    save_config(
+        &config_path,
+        &Config {
+            command: "echo baseline".to_string(),
+            autostart: false,
+            icon_path: None,
+            log_to_file: false,
+            log_file_path: None,
+        },
+    )
+    .expect("baseline config should be saved");
+
+    let lock_path = profile_lock_path_for_profile(profile).expect("lock path should resolve");
+    let _lock = acquire_profile_lock(&lock_path).expect("lock should be acquired for test");
+
+    let cli = parse_cli_args_from([
+        "givetray",
+        "desktop-file",
+        "-c",
+        profile,
+        "--command",
+        "printf changed",
+    ])
+    .expect("desktop-file cli should parse");
+
+    let err = create_desktop_file_from_cli(&cli, Some(output_dir), false)
+        .expect_err("desktop-file mode should fail when lock is already held");
+    assert!(err.contains("profile lock already held"));
+
+    let saved = fs::read_to_string(&config_path).expect("config should remain readable");
+    assert!(saved.contains("echo baseline"));
+    assert!(!saved.contains("printf changed"));
 }
 
 #[test]
