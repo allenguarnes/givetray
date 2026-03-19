@@ -552,9 +552,16 @@ pub(crate) fn detect_sudo_mode(args: &[String]) -> Option<SudoMode> {
         return None;
     }
 
+    let mut skip_next = false;
     let mut i = 1;
     while i < args.len() {
         let arg = &args[i];
+
+        if skip_next {
+            skip_next = false;
+            i += 1;
+            continue;
+        }
 
         if !arg.starts_with('-') {
             break;
@@ -569,6 +576,26 @@ pub(crate) fn detect_sudo_mode(args: &[String]) -> Option<SudoMode> {
                 if let Some(mode) = parse_sudo_short_options(arg) {
                     return Some(mode);
                 }
+                if arg.starts_with("--") {
+                    if let Some((flag, _)) = arg.split_once('=') {
+                        if sudo_option_takes_value(flag) {
+                            skip_next = true;
+                            i += 1;
+                            continue;
+                        }
+                    }
+                    if sudo_option_takes_value(arg) {
+                        skip_next = true;
+                        i += 1;
+                        continue;
+                    }
+                } else if (arg.len() == 2 && sudo_option_takes_value(arg))
+                    || (arg.len() > 2 && sudo_option_takes_value(&arg[..2]))
+                {
+                    skip_next = true;
+                    i += 1;
+                    continue;
+                }
             }
         }
         i += 1;
@@ -578,7 +605,7 @@ pub(crate) fn detect_sudo_mode(args: &[String]) -> Option<SudoMode> {
 }
 
 fn parse_sudo_short_options(arg: &str) -> Option<SudoMode> {
-    if !arg.starts_with('-') || arg.len() < 2 {
+    if !arg.starts_with('-') || arg.len() < 2 || arg.starts_with("--") {
         return None;
     }
     for ch in arg.chars().skip(1) {
@@ -590,6 +617,33 @@ fn parse_sudo_short_options(arg: &str) -> Option<SudoMode> {
         }
     }
     None
+}
+
+fn sudo_option_takes_value(arg: &str) -> bool {
+    matches!(
+        arg,
+        "-C" | "-D"
+            | "-R"
+            | "-T"
+            | "-U"
+            | "-g"
+            | "-h"
+            | "-p"
+            | "-r"
+            | "-t"
+            | "-u"
+            | "--chdir"
+            | "--chroot"
+            | "--close-from"
+            | "--command-timeout"
+            | "--group"
+            | "--host"
+            | "--other-user"
+            | "--prompt"
+            | "--role"
+            | "--type"
+            | "--user"
+    )
 }
 
 fn is_sudo_command(args: &[String]) -> bool {
