@@ -1,8 +1,10 @@
 use crate::cli::should_expose_configuration;
 use crate::config::save_configuration;
 use crate::desktop::{applications_desktop_path, apply_desktop_actions, autostart_desktop_path};
-use crate::logs::{append_log, buffer_text};
-use crate::process::{start_command, stop_command, stop_command_blocking};
+use crate::logs::{
+    append_log, apply_process_exited, buffer_text, profile_lock_action_blocked_message,
+};
+use crate::process::{can_control_profile, start_command, stop_command, stop_command_blocking};
 use crate::{AppState, ConfigCloseAction, UiEvent, MAX_UNDO};
 use async_channel::Sender;
 use glib::{ControlFlow, LogLevels, Propagation};
@@ -282,14 +284,16 @@ pub(crate) fn setup_config_handlers(state: Rc<RefCell<AppState>>) {
 
         match show_config_close_dialog(window) {
             ConfigCloseAction::Save => {
-                save_from_config_widgets(
+                let save_succeeded = save_from_config_widgets(
                     state_close.clone(),
                     &buffer_close,
                     &log_to_file_toggle_close,
                     &apps_toggle_close,
                     &system_autostart_toggle_close,
                 );
-                window.hide();
+                if save_succeeded {
+                    window.hide();
+                }
             }
             ConfigCloseAction::Discard => {
                 refresh_config_dirty_status(state_close.clone());
@@ -457,7 +461,7 @@ fn save_from_config_widgets(
     log_to_file_toggle: &gtk::CheckButton,
     apps_toggle: &gtk::CheckButton,
     system_autostart_toggle: &gtk::CheckButton,
-) {
+) -> bool {
     let text = buffer_text(buffer);
     let saved = save_configuration(state.clone(), text, log_to_file_toggle.is_active());
     if saved {
@@ -469,6 +473,7 @@ fn save_from_config_widgets(
         refresh_desktop_toggles(state.clone(), apps_toggle, system_autostart_toggle);
     }
     refresh_config_dirty_status(state);
+    saved
 }
 
 fn config_has_unsaved_changes(
@@ -552,10 +557,20 @@ pub(crate) fn setup_menu_polling(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiE
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             let id = event.id;
             if id == "start-stop" {
-                let running = {
+                let (running, can_control) = {
                     let state = state.borrow();
-                    state.child.is_some() || state.owned_pgid.is_some()
+                    (
+                        state.child.is_some() || state.owned_pgid.is_some(),
+                        can_control_profile(state.owns_profile_lock),
+                    )
                 };
+                if !can_control {
+                    append_log(
+                        &mut state.borrow_mut(),
+                        profile_lock_action_blocked_message(),
+                    );
+                    continue;
+                }
                 if running {
                     stop_command(state.clone(), ui_tx.clone());
                 } else {
@@ -707,16 +722,24 @@ pub(crate) fn setup_process_watcher(state: Rc<RefCell<AppState>>, ui_tx: Sender<
         }
 
         if has_tracked_process {
-            let state = state.borrow();
-            let child_done = state.child.is_none();
-            let group_gone = state.owned_pgid.is_none();
+            let (child_done, group_gone) = {
+                let state_ref = state.borrow();
+                (state_ref.child.is_none(), state_ref.owned_pgid.is_none())
+            };
             if should_emit_process_exited(
                 has_tracked_process,
                 child_done,
                 group_gone,
                 exit_already_reported,
             ) {
-                let _ = ui_tx.send_blocking(UiEvent::ProcessExited(exit_code));
+                match ui_tx.try_send(UiEvent::ProcessExited(exit_code)) {
+                    Ok(()) => {}
+                    Err(async_channel::TrySendError::Full(_))
+                    | Err(async_channel::TrySendError::Closed(_)) => {
+                        let mut state_ref = state.borrow_mut();
+                        apply_process_exited(&mut state_ref, exit_code);
+                    }
+                }
             }
         }
 

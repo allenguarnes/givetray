@@ -1,6 +1,6 @@
 use crate::config::{
-    apply_cli_overrides_to_config, config_path_for_profile, load_or_create_config,
-    sanitize_profile_name, save_config,
+    acquire_profile_lock, apply_cli_overrides_to_config, atomic_write, config_path_for_profile,
+    load_or_create_config, profile_lock_path_for_profile, sanitize_profile_name, save_config,
 };
 use crate::logs::append_log;
 use crate::{AppState, CliOptions, Config, APP_NAME, BUNDLED_ICON_FILE_NAME, ICON_FILE_NAME};
@@ -21,6 +21,12 @@ pub(crate) fn create_desktop_file_from_cli(
     let profile = cli
         .persistent_profile()
         .ok_or_else(|| "desktop-file requires a persistent profile".to_string())?;
+
+    let _profile_lock = match profile_lock_path_for_profile(profile) {
+        Some(path) => Some(acquire_profile_lock(&path)?),
+        None => None,
+    };
+
     let config_path = config_path_for_profile(profile)
         .ok_or_else(|| "unable to resolve configuration path".to_string())?;
     let mut config = load_or_create_config(&config_path);
@@ -323,9 +329,6 @@ fn desktop_escape_arg(value: &str) -> String {
     escaped
 }
 
-fn write_desktop_file(path: &PathBuf, contents: &str) -> Result<(), std::io::Error> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, contents)
+fn write_desktop_file(path: &Path, contents: &str) -> Result<(), String> {
+    atomic_write(path, contents)
 }

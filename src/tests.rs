@@ -6,14 +6,17 @@ use crate::cli::{
 };
 use crate::config::config_path_for_profile;
 use crate::config::{
-    clear_runtime_state, load_runtime_state, reconcile_startup_runtime_state,
+    acquire_profile_lock, atomic_write, can_save_profile_configuration, clear_runtime_state,
+    load_runtime_state, profile_lock_path_for_profile, reconcile_startup_runtime_state,
     runtime_state_path_for_ephemeral, runtime_state_path_for_profile, save_config,
-    save_runtime_state,
+    save_configuration, save_runtime_state, validate_saved_command_text,
 };
+use crate::desktop::create_desktop_file_from_cli;
 use crate::logs::{
     append_log_to_file, clear_runtime_state_after_exit, extract_log_links,
     should_activate_log_link, strip_ansi_codes,
 };
+use crate::process::can_control_profile;
 use crate::process::is_process_group_alive;
 use crate::process::reconcile_runtime_state;
 use crate::process::RuntimeReconcileResult;
@@ -23,9 +26,100 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::Mutex;
+use std::sync::{Mutex, Once};
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
+static GTK_INIT: Once = Once::new();
+
+fn ensure_gtk_initialized() {
+    GTK_INIT.call_once(|| {
+        gtk::init().expect("gtk should initialize for ui-backed tests");
+    });
+}
+
+fn build_save_test_state(temp_root: &Path) -> Rc<RefCell<AppState>> {
+    ensure_gtk_initialized();
+
+    let profile = "save-test";
+    let config_path = temp_root.join("config").join("save-test.toml");
+    let (
+        logs_window,
+        logs_view,
+        logs_buffer,
+        logs_clear_button,
+        logs_copy_button,
+        logs_status_label,
+    ) = crate::logs::build_logs_window();
+    let (
+        config_window,
+        config_view,
+        config_buffer,
+        config_autostart,
+        config_log_to_file,
+        config_applications,
+        config_system_autostart,
+        config_save_button,
+        config_status_label,
+    ) = crate::ui::build_config_window(profile, "echo ready", false, false);
+    let about_window = crate::ui::build_about_window(None);
+    let start_stop_item = tray_icon::menu::MenuItem::with_id(
+        tray_icon::menu::MenuId::new("test-start-stop"),
+        "Start",
+        true,
+        None,
+    );
+
+    Rc::new(RefCell::new(AppState {
+        persistent_config_access: Some(PersistentConfigAccess {
+            profile: profile.to_string(),
+            config_path,
+        }),
+        command: "echo ready".to_string(),
+        saved_command: "echo ready".to_string(),
+        saved_autostart: false,
+        saved_icon_path: None,
+        saved_log_to_file: false,
+        saved_log_file_path: None,
+        child: None,
+        owned_pgid: None,
+        owned_pid: None,
+        process_exit_reported: false,
+        runtime_state_path: None,
+        restored_running: false,
+        owns_profile_lock: true,
+        profile_lock: None,
+        log_lines: VecDeque::new(),
+        log_links: VecDeque::new(),
+        log_file_path: None,
+        log_file_writer: None,
+        logs_window,
+        logs_view,
+        logs_buffer,
+        logs_clear_button,
+        logs_copy_button,
+        logs_status_label,
+        about_window,
+        config_window,
+        config_view,
+        config_buffer,
+        config_autostart,
+        config_log_to_file,
+        config_applications,
+        config_system_autostart,
+        config_save_button,
+        config_status_label,
+        config_saved_applications: false,
+        config_saved_system_autostart: false,
+        config_undo: Vec::new(),
+        config_redo: Vec::new(),
+        config_last: "echo ready".to_string(),
+        config_ignore: false,
+        start_stop_item,
+    }))
+}
 
 struct TestEnvGuard {
     home: Option<String>,
@@ -151,6 +245,37 @@ fn parse_ephemeral_mode_passes_through_version_flag() {
 }
 
 #[test]
+fn save_configuration_rejects_empty_command() {
+    assert!(validate_saved_command_text("   ").is_err());
+}
+
+#[test]
+fn save_configuration_rejects_unparseable_command() {
+    assert!(validate_saved_command_text("unterminated '").is_err());
+}
+
+#[test]
+fn save_configuration_returns_false_for_invalid_command() {
+    let _env_lock = ENV_LOCK.lock().expect("env lock should be acquired");
+    let temp_root = unique_test_dir("save-configuration-invalid-command");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+    let state = build_save_test_state(&temp_root);
+
+    let saved = save_configuration(state.clone(), "unterminated '".to_string(), false);
+    assert!(!saved);
+
+    let state_ref = state.borrow();
+    let last_log = state_ref
+        .log_lines
+        .back()
+        .expect("save failure should append a log line");
+    assert!(last_log.contains("invalid command:"));
+    assert!(!last_log.contains("Invalid command: invalid command:"));
+    assert_eq!(state_ref.saved_command, "echo ready");
+}
+
+#[test]
 fn reject_empty_ephemeral_mode() {
     let err = parse_cli_args_from(["givetray", "--"]).expect_err("empty ephemeral mode must fail");
 
@@ -180,6 +305,14 @@ fn reject_profile_only_flags_in_ephemeral_mode() {
 
     assert!(err.contains("ephemeral mode"));
     assert!(err.contains("--log-file"));
+}
+
+#[test]
+fn cli_rejects_invalid_command_override() {
+    let err = parse_cli_args_from(["givetray", "-c", "test", "--command", "unterminated '"])
+        .expect_err("invalid command override must fail");
+
+    assert!(err.contains("invalid"));
 }
 
 #[test]
@@ -411,6 +544,8 @@ fn ephemeral_mode_hides_configuration_menu() {
         runtime_state_path: None,
         runtime_ownership: None,
         restored_running: false,
+        owns_profile_lock: true,
+        profile_lock: None,
         startup_message: None,
     };
 
@@ -439,12 +574,105 @@ fn persistent_mode_exposes_configuration_menu() {
         runtime_state_path: None,
         runtime_ownership: None,
         restored_running: false,
+        owns_profile_lock: true,
+        profile_lock: None,
         startup_message: None,
     };
 
     assert!(should_expose_configuration(
         startup.persistent_config_access.as_ref()
     ));
+}
+
+#[test]
+fn startup_state_can_mark_profile_lock_conflict() {
+    let startup = StartupState {
+        profile_label: "default".to_string(),
+        persistent_config_access: None,
+        config: Config {
+            command: DEFAULT_COMMAND.to_string(),
+            autostart: false,
+            icon_path: None,
+            log_to_file: false,
+            log_file_path: None,
+        },
+        log_file_path: None,
+        launch_on_startup: false,
+        runtime_state_path: None,
+        runtime_ownership: None,
+        restored_running: false,
+        owns_profile_lock: false,
+        profile_lock: None,
+        startup_message: Some(RUNTIME_ALREADY_OPEN_MESSAGE.to_string()),
+    };
+
+    assert!(!startup.owns_profile_lock);
+    assert!(startup.profile_lock.is_none());
+    assert_eq!(
+        startup.startup_message.as_deref(),
+        Some(RUNTIME_ALREADY_OPEN_MESSAGE)
+    );
+}
+
+#[test]
+fn startup_state_default_owns_profile_lock_for_persistent_profile() {
+    let _env_lock = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let temp_root = unique_test_dir("startup-state-persistent-lock-ownership");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let cli = parse_cli_args_from(["givetray", "-c", "default"])
+        .expect("persistent profile mode should parse");
+    let startup = build_startup_state(&cli).expect("persistent startup should build");
+
+    assert!(startup.owns_profile_lock);
+    assert!(startup.profile_lock.is_some());
+}
+
+#[test]
+fn second_same_profile_instance_skips_runtime_recovery() {
+    let _env_lock = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let temp_root = unique_test_dir("second-instance-runtime-skip");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let cli = parse_cli_args_from(["givetray", "-c", "default"])
+        .expect("persistent profile mode should parse");
+
+    let startup1 = build_startup_state(&cli).expect("first instance should build");
+    assert!(startup1.owns_profile_lock);
+    assert!(startup1.profile_lock.is_some());
+
+    let startup2 = build_startup_state(&cli).expect("second instance should build");
+    assert!(!startup2.owns_profile_lock);
+    assert!(startup2.profile_lock.is_none());
+    assert!(startup2.runtime_ownership.is_none());
+    assert_eq!(
+        startup2.startup_message.as_deref(),
+        Some(RUNTIME_ALREADY_OPEN_MESSAGE)
+    );
+
+    drop(startup1);
+
+    let startup3 =
+        build_startup_state(&cli).expect("third instance should build after lock release");
+    assert!(startup3.owns_profile_lock);
+    assert!(startup3.profile_lock.is_some());
+}
+
+#[test]
+fn startup_state_ephemeral_owns_no_profile_lock() {
+    let _env_lock = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let temp_root = unique_test_dir("startup-state-ephemeral-lock-ownership");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let cli = parse_cli_args_from(["givetray", "--", "echo", "hello"])
+        .expect("ephemeral mode should parse");
+    let startup = build_startup_state(&cli).expect("ephemeral startup should build");
+
+    assert!(!startup.owns_profile_lock);
+    assert!(startup.profile_lock.is_none());
 }
 
 #[test]
@@ -491,6 +719,8 @@ fn persistent_startup_state_exposes_configuration_from_source_of_truth() {
         runtime_state_path: None,
         runtime_ownership: None,
         restored_running: false,
+        owns_profile_lock: true,
+        profile_lock: None,
         startup_message: None,
     };
 
@@ -500,8 +730,8 @@ fn persistent_startup_state_exposes_configuration_from_source_of_truth() {
 }
 
 #[test]
-fn startup_preflight_runs_before_detach_for_persistent_profiles() {
-    let _env_lock = ENV_LOCK.lock().expect("env lock should be acquired");
+fn startup_preflight_runs_after_detach_for_persistent_profiles() {
+    let _env_lock = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
     let temp_root = unique_test_dir("startup-preflight-order");
     fs::create_dir_all(&temp_root).expect("temp root should be created");
     let _env = TestEnvGuard::set(&temp_root);
@@ -514,17 +744,104 @@ fn startup_preflight_runs_before_detach_for_persistent_profiles() {
             .persistent_profile()
             .expect("profile should still be persistent");
         let config_path = config_path_for_profile(profile).expect("config path should resolve");
-        let saved = fs::read_to_string(&config_path)
-            .expect("config should already be written before detach");
-
-        assert!(saved.contains("printf ready"));
+        assert!(!config_path.exists());
 
         Ok(())
     })
     .expect("startup preparation should succeed");
 
+    let config_path = config_path_for_profile("preflight").expect("config path should resolve");
+    let saved = fs::read_to_string(&config_path).expect("config should be written after detach");
+    assert!(saved.contains("printf ready"));
     assert_eq!(startup.config.command, "printf ready");
     assert!(startup.persistent_config_access.is_some());
+}
+
+#[test]
+fn startup_preflight_does_not_persist_cli_overrides_without_profile_lock() {
+    let _env_lock = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let temp_root = unique_test_dir("startup-preflight-lock-guard");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let profile = "preflight-locked";
+    let config_path = config_path_for_profile(profile).expect("config path should resolve");
+    save_config(
+        &config_path,
+        &Config {
+            command: "echo baseline".to_string(),
+            autostart: false,
+            icon_path: None,
+            log_to_file: false,
+            log_file_path: None,
+        },
+    )
+    .expect("baseline config should be saved");
+
+    let lock_path = profile_lock_path_for_profile(profile).expect("lock path should resolve");
+    let _lock = acquire_profile_lock(&lock_path).expect("lock should be acquired for test");
+
+    let cli = parse_cli_args_from(["givetray", "-c", profile, "--command", "printf changed"])
+        .expect("persistent cli should parse");
+
+    let startup = prepare_run_startup_with(&cli, |_| Ok(()))
+        .expect("startup preparation should still return non-owning startup state");
+
+    assert!(!startup.owns_profile_lock);
+    assert_eq!(
+        startup.startup_message.as_deref(),
+        Some(RUNTIME_ALREADY_OPEN_MESSAGE)
+    );
+    assert_eq!(startup.config.command, "echo baseline");
+
+    let saved = fs::read_to_string(&config_path).expect("config should remain readable");
+    assert!(saved.contains("echo baseline"));
+    assert!(!saved.contains("printf changed"));
+}
+
+#[test]
+fn desktop_file_creation_requires_profile_lock_before_persisting_overrides() {
+    let _env_lock = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let temp_root = unique_test_dir("desktop-file-lock-guard");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let output_dir = temp_root.join("desktop");
+    fs::create_dir_all(&output_dir).expect("output dir should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let profile = "desktop-locked";
+    let config_path = config_path_for_profile(profile).expect("config path should resolve");
+    save_config(
+        &config_path,
+        &Config {
+            command: "echo baseline".to_string(),
+            autostart: false,
+            icon_path: None,
+            log_to_file: false,
+            log_file_path: None,
+        },
+    )
+    .expect("baseline config should be saved");
+
+    let lock_path = profile_lock_path_for_profile(profile).expect("lock path should resolve");
+    let _lock = acquire_profile_lock(&lock_path).expect("lock should be acquired for test");
+
+    let cli = parse_cli_args_from([
+        "givetray",
+        "desktop-file",
+        "-c",
+        profile,
+        "--command",
+        "printf changed",
+    ])
+    .expect("desktop-file cli should parse");
+
+    let err = create_desktop_file_from_cli(&cli, Some(output_dir), false)
+        .expect_err("desktop-file mode should fail when lock is already held");
+    assert!(err.contains("profile lock already held"));
+
+    let saved = fs::read_to_string(&config_path).expect("config should remain readable");
+    assert!(saved.contains("echo baseline"));
+    assert!(!saved.contains("printf changed"));
 }
 
 #[test]
@@ -776,6 +1093,62 @@ fn runtime_state_path_resolves_for_profile() {
 }
 
 #[test]
+fn profile_lock_path_resolves_for_profile() {
+    let _env_lock = ENV_LOCK.lock().expect("env lock should be acquired");
+    let temp_root = unique_test_dir("profile-lock-path");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let path = profile_lock_path_for_profile("demo").expect("lock path should resolve");
+
+    assert!(path.to_string_lossy().contains("demo"));
+}
+
+#[test]
+fn acquiring_same_profile_lock_twice_fails() {
+    let _env_lock = ENV_LOCK.lock().expect("env lock should be acquired");
+    let temp_root = unique_test_dir("profile-lock-double-acquire");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let path = profile_lock_path_for_profile("demo").expect("lock path should resolve");
+    let _first = acquire_profile_lock(&path).expect("first lock should succeed");
+
+    assert!(acquire_profile_lock(&path).is_err());
+}
+
+#[test]
+fn dropping_profile_lock_releases_for_reacquisition() {
+    let _env_lock = ENV_LOCK.lock().expect("env lock should be acquired");
+    let temp_root = unique_test_dir("profile-lock-release-reacquire");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let path = profile_lock_path_for_profile("release-test").expect("lock path should resolve");
+    {
+        let _lock = acquire_profile_lock(&path).expect("first lock should succeed");
+    }
+
+    let _second = acquire_profile_lock(&path).expect("second lock should succeed after drop");
+}
+
+#[test]
+fn non_owning_profile_session_cannot_start_command() {
+    assert!(!can_control_profile(false));
+}
+
+#[test]
+fn non_owning_profile_session_cannot_save_configuration() {
+    assert!(!can_save_profile_configuration(false));
+}
+
+#[test]
+fn log_overflow_is_coalesced_into_one_message() {
+    let msg = coalesced_log_overflow_message(42);
+    assert!(msg.contains("42"));
+}
+
+#[test]
 fn runtime_state_path_resolves_for_ephemeral() {
     let _env_lock = ENV_LOCK.lock().expect("env lock should be acquired");
     let temp_root = unique_test_dir("runtime-state-ephemeral-path");
@@ -810,6 +1183,62 @@ fn save_and_load_runtime_state() {
     assert_eq!(loaded.pid, 9999);
     assert_eq!(loaded.pgid, 9999);
     assert_eq!(loaded.profile_name.as_deref(), Some("testprofile"));
+}
+
+#[test]
+fn atomic_write_replaces_existing_file_contents() {
+    let temp_dir = unique_test_dir("atomic-write-test");
+    fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+    let file_path = temp_dir.join("test.txt");
+
+    let old_contents = "old contents\nmultiple lines\n";
+    fs::write(&file_path, old_contents).expect("should write old contents");
+
+    let new_contents = "new contents\n";
+    let result = atomic_write(&file_path, new_contents);
+    assert!(result.is_ok(), "atomic_write should succeed");
+
+    let read_back = fs::read_to_string(&file_path).expect("should read file");
+    assert_eq!(read_back, new_contents);
+}
+
+#[test]
+fn atomic_write_creates_deeply_nested_missing_parent_directories() {
+    let temp_dir = unique_test_dir("atomic-write-nested-parents");
+    fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+    let file_path = temp_dir
+        .join("nested")
+        .join("profile")
+        .join("configs")
+        .join("settings.toml");
+
+    atomic_write(&file_path, "enabled = true\n").expect("atomic_write should succeed");
+
+    assert!(file_path.exists(), "atomic write should create target file");
+    let read_back = fs::read_to_string(&file_path).expect("should read file");
+    assert_eq!(read_back, "enabled = true\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_write_preserves_existing_file_permissions() {
+    let temp_dir = unique_test_dir("atomic-write-permissions");
+    fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+    let file_path = temp_dir.join("secure.txt");
+
+    fs::write(&file_path, "old").expect("should create file");
+    let secure_mode = 0o600;
+    fs::set_permissions(&file_path, fs::Permissions::from_mode(secure_mode))
+        .expect("should set secure permissions");
+
+    atomic_write(&file_path, "new").expect("atomic_write should succeed");
+
+    let mode_after = fs::metadata(&file_path)
+        .expect("metadata should be readable")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode_after, secure_mode);
 }
 
 #[test]
@@ -1013,6 +1442,8 @@ fn startup_runtime_state_no_state_stops() {
         runtime_state_path: None,
         runtime_ownership: None,
         restored_running: false,
+        owns_profile_lock: true,
+        profile_lock: None,
         startup_message: None,
     };
 
@@ -1050,6 +1481,8 @@ fn startup_runtime_state_recovered_running() {
         runtime_state_path: Some(PathBuf::from("/tmp/runtime-state.toml")),
         runtime_ownership: Some(ownership),
         restored_running: true,
+        owns_profile_lock: true,
+        profile_lock: None,
         startup_message: None,
     };
 
@@ -1088,6 +1521,8 @@ fn startup_runtime_state_stale_clears() {
         runtime_state_path: Some(PathBuf::from("/tmp/runtime-state.toml")),
         runtime_ownership: Some(ownership),
         restored_running: false,
+        owns_profile_lock: true,
+        profile_lock: None,
         startup_message: None,
     };
 
@@ -1136,6 +1571,8 @@ fn startup_reconcile_dead_runtime_state_gets_cleared() {
         runtime_state_path: Some(state_path.clone()),
         runtime_ownership: Some(dead_state),
         restored_running: false,
+        owns_profile_lock: true,
+        profile_lock: None,
         startup_message: None,
     };
 
@@ -1193,6 +1630,8 @@ fn startup_reconcile_live_runtime_state_sets_restored_running() {
         runtime_state_path: Some(state_path),
         runtime_ownership: Some(live_state),
         restored_running: false,
+        owns_profile_lock: true,
+        profile_lock: None,
         startup_message: None,
     };
 
@@ -1242,6 +1681,8 @@ fn startup_reconcile_invalid_runtime_state_falls_back_to_stopped() {
         runtime_state_path: Some(state_path.clone()),
         runtime_ownership: Some(invalid_state),
         restored_running: false,
+        owns_profile_lock: true,
+        profile_lock: None,
         startup_message: None,
     };
 
@@ -1302,6 +1743,8 @@ fn should_launch_on_startup_skips_relaunch_for_restored_run() {
         runtime_state_path: None,
         runtime_ownership: None,
         restored_running: true,
+        owns_profile_lock: true,
+        profile_lock: None,
         startup_message: None,
     };
 
@@ -1325,6 +1768,8 @@ fn should_launch_on_startup_runs_when_not_restored() {
         runtime_state_path: None,
         runtime_ownership: None,
         restored_running: false,
+        owns_profile_lock: true,
+        profile_lock: None,
         startup_message: None,
     };
 
@@ -1362,6 +1807,8 @@ fn startup_reconcile_sets_restored_message() {
             ephemeral: false,
         }),
         restored_running: false,
+        owns_profile_lock: true,
+        profile_lock: None,
         startup_message: None,
     };
 
@@ -1549,7 +1996,11 @@ mod stop_process_group {
 }
 
 mod sudo_mode_detection {
-    use crate::process::{detect_sudo_mode, sudo_mode_needs_prompt, SudoMode};
+    use crate::process::{detect_sudo_mode, SudoMode};
+
+    fn needs_password(args: &[String]) -> bool {
+        matches!(detect_sudo_mode(args), Some(SudoMode::Plain))
+    }
 
     #[test]
     fn sudo_askpass_mode_skips_stdin_injection() {
@@ -1561,19 +2012,19 @@ mod sudo_mode_detection {
     #[test]
     fn sudo_noninteractive_mode_skips_password_prompt() {
         let args = vec!["sudo".to_string(), "-n".to_string(), "echo".to_string()];
-        assert!(!sudo_mode_needs_prompt(&args));
+        assert!(!needs_password(&args));
     }
 
     #[test]
     fn sudo_plain_mode_needs_password() {
         let args = vec!["sudo".to_string(), "echo".to_string()];
-        assert!(sudo_mode_needs_prompt(&args));
+        assert!(needs_password(&args));
     }
 
     #[test]
     fn sudo_stdin_mode_skips_password_prompt() {
         let args = vec!["sudo".to_string(), "-S".to_string(), "echo".to_string()];
-        assert!(!sudo_mode_needs_prompt(&args));
+        assert!(!needs_password(&args));
     }
 
     #[test]
@@ -1589,34 +2040,225 @@ mod sudo_mode_detection {
     }
 
     #[test]
-    fn sudo_with_absolute_path_detected() {
+    fn sudo_absolute_path_needs_password() {
         let args = vec!["/usr/bin/sudo".to_string(), "echo".to_string()];
-        let mode = detect_sudo_mode(&args);
-        assert!(matches!(mode, Some(SudoMode::Plain)));
-        assert!(sudo_mode_needs_prompt(&args));
+        assert!(needs_password(&args));
     }
 
     #[test]
-    fn sudo_bundled_option_sn_returns_stdin() {
+    fn sudo_short_option_bundle_an() {
+        let args = vec!["sudo".to_string(), "-An".to_string(), "echo".to_string()];
+        assert!(!needs_password(&args));
+    }
+
+    #[test]
+    fn sudo_short_option_bundle_sn() {
         let args = vec!["sudo".to_string(), "-Sn".to_string(), "echo".to_string()];
+        assert!(!needs_password(&args));
+    }
+
+    #[test]
+    fn sudo_long_option_non_interactive_recognized() {
+        let args = vec![
+            "sudo".to_string(),
+            "--non-interactive".to_string(),
+            "echo".to_string(),
+        ];
+        let mode = detect_sudo_mode(&args);
+        assert!(matches!(mode, Some(SudoMode::NonInteractive)));
+        assert!(!needs_password(&args));
+    }
+
+    #[test]
+    fn sudo_long_option_askpass_recognized() {
+        let args = vec![
+            "sudo".to_string(),
+            "--askpass".to_string(),
+            "echo".to_string(),
+        ];
+        let mode = detect_sudo_mode(&args);
+        assert!(matches!(mode, Some(SudoMode::Askpass)));
+        assert!(!needs_password(&args));
+    }
+
+    #[test]
+    fn sudo_long_option_stdin_recognized() {
+        let args = vec![
+            "sudo".to_string(),
+            "--stdin".to_string(),
+            "echo".to_string(),
+        ];
         let mode = detect_sudo_mode(&args);
         assert!(matches!(mode, Some(SudoMode::Stdin)));
-        assert!(!sudo_mode_needs_prompt(&args));
+        assert!(!needs_password(&args));
     }
 
     #[test]
-    fn sudo_bundled_option_an_returns_askpass() {
-        let args = vec!["sudo".to_string(), "-An".to_string(), "echo".to_string()];
+    fn sudo_stops_at_first_non_option() {
+        let args = vec![
+            "sudo".to_string(),
+            "-n".to_string(),
+            "--".to_string(),
+            "-n".to_string(),
+        ];
         let mode = detect_sudo_mode(&args);
-        assert!(matches!(mode, Some(SudoMode::Askpass)));
-        assert!(!sudo_mode_needs_prompt(&args));
+        assert!(matches!(mode, Some(SudoMode::NonInteractive)));
     }
 
     #[test]
-    fn sudo_bundled_option_as_returns_askpass() {
-        let args = vec!["sudo".to_string(), "-AS".to_string(), "echo".to_string()];
+    fn sudo_command_args_not_misclassified() {
+        let args = vec![
+            "sudo".to_string(),
+            "myapp".to_string(),
+            "-n".to_string(),
+            "--flag".to_string(),
+        ];
         let mode = detect_sudo_mode(&args);
-        assert!(matches!(mode, Some(SudoMode::Askpass)));
-        assert!(!sudo_mode_needs_prompt(&args));
+        assert!(matches!(mode, Some(SudoMode::Plain)));
+        assert!(needs_password(&args));
+    }
+
+    #[test]
+    fn sudo_unrelated_long_option_not_misclassified() {
+        let args = vec![
+            "sudo".to_string(),
+            "--login".to_string(),
+            "echo".to_string(),
+        ];
+        let mode = detect_sudo_mode(&args);
+        assert!(matches!(mode, Some(SudoMode::Plain)));
+        assert!(needs_password(&args));
+    }
+
+    #[test]
+    fn sudo_option_with_value_before_n() {
+        let args = vec![
+            "sudo".to_string(),
+            "-u".to_string(),
+            "root".to_string(),
+            "-n".to_string(),
+            "echo".to_string(),
+        ];
+        let mode = detect_sudo_mode(&args);
+        assert!(matches!(mode, Some(SudoMode::NonInteractive)));
+        assert!(!needs_password(&args));
+    }
+
+    #[test]
+    fn sudo_attached_long_option_value_before_n() {
+        let args = vec![
+            "sudo".to_string(),
+            "--user=root".to_string(),
+            "-n".to_string(),
+            "echo".to_string(),
+        ];
+        let mode = detect_sudo_mode(&args);
+        assert!(matches!(mode, Some(SudoMode::NonInteractive)));
+        assert!(!needs_password(&args));
+    }
+
+    #[test]
+    fn sudo_attached_short_option_value_before_n() {
+        let args = vec![
+            "sudo".to_string(),
+            "-uroot".to_string(),
+            "-n".to_string(),
+            "echo".to_string(),
+        ];
+        let mode = detect_sudo_mode(&args);
+        assert!(matches!(mode, Some(SudoMode::NonInteractive)));
+        assert!(!needs_password(&args));
+    }
+
+    #[test]
+    fn sudo_short_bundle_with_u_attached_value_is_plain() {
+        let args = vec!["sudo".to_string(), "-uann".to_string(), "echo".to_string()];
+        let mode = detect_sudo_mode(&args);
+        assert!(matches!(mode, Some(SudoMode::Plain)));
+        assert!(needs_password(&args));
+    }
+
+    #[test]
+    fn sudo_short_bundle_with_p_attached_value_is_plain() {
+        let args = vec![
+            "sudo".to_string(),
+            "-pSecret".to_string(),
+            "echo".to_string(),
+        ];
+        let mode = detect_sudo_mode(&args);
+        assert!(matches!(mode, Some(SudoMode::Plain)));
+        assert!(needs_password(&args));
+    }
+
+    #[test]
+    fn sudo_short_bundle_preserves_flags_before_value_taker() {
+        let args = vec!["sudo".to_string(), "-nuann".to_string(), "echo".to_string()];
+        let mode = detect_sudo_mode(&args);
+        assert!(matches!(mode, Some(SudoMode::NonInteractive)));
+        assert!(!needs_password(&args));
+    }
+}
+
+mod sudo_stdin_injection {
+    use crate::process::ensure_sudo_stdin_flag;
+
+    fn has_stdin_flag(args: &[String]) -> bool {
+        args.iter().any(|arg| arg == "-S" || arg == "--stdin")
+    }
+
+    #[test]
+    fn plain_sudo_gets_s_injected() {
+        let mut args = vec!["sudo".to_string(), "echo".to_string()];
+        ensure_sudo_stdin_flag(&mut args);
+        assert!(has_stdin_flag(&args));
+        assert_eq!(args[0], "sudo");
+        assert_eq!(args[1], "-S");
+        assert_eq!(args[2], "echo");
+    }
+
+    #[test]
+    fn already_has_s_flag_not_duplicated() {
+        let mut args = vec!["sudo".to_string(), "-S".to_string(), "echo".to_string()];
+        ensure_sudo_stdin_flag(&mut args);
+        assert!(has_stdin_flag(&args));
+        assert_eq!(args[1], "-S");
+    }
+
+    #[test]
+    fn already_has_long_stdin_not_duplicated() {
+        let mut args = vec![
+            "sudo".to_string(),
+            "--stdin".to_string(),
+            "echo".to_string(),
+        ];
+        ensure_sudo_stdin_flag(&mut args);
+        assert!(has_stdin_flag(&args));
+        assert_eq!(args[1], "--stdin");
+    }
+
+    #[test]
+    fn already_has_askpass_not_duplicated() {
+        let mut args = vec![
+            "sudo".to_string(),
+            "--askpass".to_string(),
+            "echo".to_string(),
+        ];
+        ensure_sudo_stdin_flag(&mut args);
+        assert!(!has_stdin_flag(&args));
+    }
+
+    #[test]
+    fn bundled_option_sn_has_stdin() {
+        let mut args = vec!["sudo".to_string(), "-Sn".to_string(), "echo".to_string()];
+        ensure_sudo_stdin_flag(&mut args);
+        assert!(has_stdin_flag(&args));
+    }
+
+    #[test]
+    fn single_arg_sudo_gets_s_at_end() {
+        let mut args = vec!["sudo".to_string()];
+        ensure_sudo_stdin_flag(&mut args);
+        assert!(has_stdin_flag(&args));
+        assert_eq!(args[1], "-S");
     }
 }

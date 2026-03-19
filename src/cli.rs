@@ -1,22 +1,24 @@
 use crate::config::{
-    apply_cli_overrides_to_config, clear_runtime_state, config_path_for_profile,
-    load_or_create_config, load_runtime_state_result, resolve_log_file_path,
-    runtime_state_path_for_ephemeral, runtime_state_path_for_profile, save_config,
+    acquire_profile_lock, apply_cli_overrides_to_config, clear_runtime_state,
+    config_path_for_profile, load_or_create_config, load_runtime_state_result,
+    profile_lock_path_for_profile, resolve_log_file_path, runtime_state_path_for_ephemeral,
+    runtime_state_path_for_profile, save_config, validate_saved_command_text,
     RuntimeStateLoadResult,
 };
 use crate::{
     CliMode, CliOptions, CliRequest, CliRunTarget, Config, PersistentConfigAccess, StartupState,
-    APP_NAME, BG_CHILD_ENV, MAX_COMMAND_LENGTH, MAX_PROFILE_LENGTH,
+    APP_NAME, BG_CHILD_ENV, DEFAULT_COMMAND, MAX_PROFILE_LENGTH, RUNTIME_ALREADY_OPEN_MESSAGE,
     RUNTIME_INVALID_CLEARED_MESSAGE,
 };
 use std::env;
+use std::fs;
 use std::io;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub(crate) fn detach_to_background_if_needed(cli: &CliOptions) -> Result<(), String> {
     if env::var_os(BG_CHILD_ENV).is_some() {
@@ -54,7 +56,19 @@ pub(crate) fn detach_to_background_if_needed(cli: &CliOptions) -> Result<(), Str
         .spawn()
         .map_err(|err| format!("unable to spawn detached process: {err}"))?;
 
-    thread::sleep(Duration::from_millis(120));
+    // This is a startup heuristic, not a full parent/child readiness handshake.
+    // It catches immediate startup failures, but failures after this window remain
+    // the detached child's responsibility to report via its own logging path.
+    let startup_timeout = Duration::from_millis(1_000);
+    let poll_interval = Duration::from_millis(50);
+    let start = Instant::now();
+    while start.elapsed() < startup_timeout {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(format!("detached process exited early: {status}"));
+        }
+        thread::sleep(poll_interval);
+    }
+
     if let Ok(Some(status)) = child.try_wait() {
         return Err(format!("detached process exited early: {status}"));
     }
@@ -147,38 +161,64 @@ pub(crate) fn ephemeral_runtime_config(argv: &[String]) -> Config {
     }
 }
 
+pub(crate) struct PreflightState {
+    profile: String,
+    config_path: PathBuf,
+    config: Config,
+}
+
+fn acquire_profile_lock_for_startup(
+    profile: &str,
+) -> Result<(bool, Option<crate::config::ProfileLockHandle>), String> {
+    let lock_path = profile_lock_path_for_profile(profile);
+    match lock_path {
+        Some(ref path) => match acquire_profile_lock(path) {
+            Ok(handle) => Ok((true, Some(handle))),
+            Err(err) if err.contains("profile lock already held") => Ok((false, None)),
+            Err(err) => Err(err),
+        },
+        None => Ok((true, None)),
+    }
+}
+
+fn load_config_without_side_effects(path: &Path) -> Config {
+    let default = Config {
+        command: DEFAULT_COMMAND.to_string(),
+        autostart: false,
+        icon_path: None,
+        log_to_file: false,
+        log_file_path: None,
+    };
+
+    let content = match fs::read_to_string(path) {
+        Ok(data) => data,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return default,
+        Err(err) => {
+            eprintln!("failed to read config at {}: {err}", path.display());
+            return default;
+        }
+    };
+
+    match toml::from_str(&content) {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("failed to parse config at {}: {err}", path.display());
+            default
+        }
+    }
+}
+
 pub(crate) fn build_startup_state(cli: &CliOptions) -> Result<StartupState, String> {
     match &cli.run_target {
         CliRunTarget::PersistentProfile { profile } => {
-            let config_path = config_path_for_profile(profile)
-                .ok_or_else(|| "failed to resolve configuration path".to_string())?;
-            let mut config = load_or_create_config(&config_path);
+            let (owns_profile_lock, profile_lock) = acquire_profile_lock_for_startup(profile)?;
+            let preflight = if owns_profile_lock {
+                prepare_preflight_for_persistent_profile(profile, cli)?
+            } else {
+                prepare_readonly_preflight_for_persistent_profile(profile)?
+            };
 
-            match apply_cli_overrides_to_config(&mut config, cli) {
-                Ok(true) => save_config(&config_path, &config)
-                    .map_err(|err| format!("failed to save config overrides: {err}"))?,
-                Ok(false) => {}
-                Err(err) => return Err(format!("failed to apply CLI overrides: {err}")),
-            }
-
-            let runtime_state_path = runtime_state_path_for_profile(profile);
-            let (runtime_ownership, startup_message) =
-                load_startup_runtime_state(runtime_state_path.as_deref());
-
-            Ok(StartupState {
-                profile_label: profile.clone(),
-                persistent_config_access: persistent_config_access(
-                    Some(profile.clone()),
-                    Some(config_path),
-                ),
-                log_file_path: resolve_log_file_path(profile, &config),
-                launch_on_startup: config.autostart,
-                config,
-                runtime_state_path,
-                runtime_ownership,
-                restored_running: false,
-                startup_message,
-            })
+            complete_persistent_startup(preflight, owns_profile_lock, profile_lock)
         }
         CliRunTarget::EphemeralArgv { argv } => {
             let runtime_state_path = runtime_state_path_for_ephemeral();
@@ -194,10 +234,88 @@ pub(crate) fn build_startup_state(cli: &CliOptions) -> Result<StartupState, Stri
                 runtime_state_path,
                 runtime_ownership,
                 restored_running: false,
+                owns_profile_lock: false,
+                profile_lock: None,
                 startup_message,
             })
         }
     }
+}
+
+pub(crate) fn prepare_preflight_for_persistent_profile(
+    profile: &str,
+    cli: &CliOptions,
+) -> Result<PreflightState, String> {
+    let config_path = config_path_for_profile(profile)
+        .ok_or_else(|| "failed to resolve configuration path".to_string())?;
+    let mut config = load_or_create_config(&config_path);
+
+    match apply_cli_overrides_to_config(&mut config, cli) {
+        Ok(true) => save_config(&config_path, &config)
+            .map_err(|err| format!("failed to save config overrides: {err}"))?,
+        Ok(false) => {}
+        Err(err) => return Err(format!("failed to apply CLI overrides: {err}")),
+    }
+
+    Ok(PreflightState {
+        profile: profile.to_string(),
+        config_path,
+        config,
+    })
+}
+
+fn prepare_readonly_preflight_for_persistent_profile(
+    profile: &str,
+) -> Result<PreflightState, String> {
+    let config_path = config_path_for_profile(profile)
+        .ok_or_else(|| "failed to resolve configuration path".to_string())?;
+    let config = load_config_without_side_effects(&config_path);
+
+    Ok(PreflightState {
+        profile: profile.to_string(),
+        config_path,
+        config,
+    })
+}
+
+pub(crate) fn complete_persistent_startup(
+    preflight: PreflightState,
+    owns_profile_lock: bool,
+    profile_lock: Option<crate::config::ProfileLockHandle>,
+) -> Result<StartupState, String> {
+    let PreflightState {
+        profile,
+        config_path,
+        config,
+    } = preflight;
+
+    let (runtime_ownership, startup_message) = if owns_profile_lock {
+        let runtime_state_path = runtime_state_path_for_profile(&profile);
+        load_startup_runtime_state(runtime_state_path.as_deref())
+    } else {
+        (None, Some(RUNTIME_ALREADY_OPEN_MESSAGE.to_string()))
+    };
+
+    Ok(StartupState {
+        profile_label: profile.clone(),
+        persistent_config_access: persistent_config_access(
+            Some(profile.clone()),
+            Some(config_path),
+        ),
+        log_file_path: resolve_log_file_path(&profile, &config),
+        launch_on_startup: config.autostart,
+        config,
+        runtime_state_path: if owns_profile_lock {
+            runtime_state_path_for_profile(&profile)
+        } else {
+            None
+        },
+        runtime_ownership,
+        restored_running: false,
+        owns_profile_lock,
+        profile_lock,
+        startup_message,
+    })
 }
 
 fn load_startup_runtime_state(
@@ -230,9 +348,22 @@ pub(crate) fn prepare_run_startup_with<F>(
 where
     F: FnOnce(&CliOptions) -> Result<(), String>,
 {
-    let startup = build_startup_state(cli)?;
-    detach(cli).map_err(|err| format!("failed to start background instance: {err}"))?;
-    Ok(startup)
+    match &cli.run_target {
+        CliRunTarget::PersistentProfile { profile } => {
+            detach(cli).map_err(|err| format!("failed to start background instance: {err}"))?;
+            let (owns_profile_lock, profile_lock) = acquire_profile_lock_for_startup(profile)?;
+            let preflight = if owns_profile_lock {
+                prepare_preflight_for_persistent_profile(profile, cli)?
+            } else {
+                prepare_readonly_preflight_for_persistent_profile(profile)?
+            };
+            complete_persistent_startup(preflight, owns_profile_lock, profile_lock)
+        }
+        CliRunTarget::EphemeralArgv { .. } => {
+            detach(cli).map_err(|err| format!("failed to start background instance: {err}"))?;
+            build_startup_state(cli)
+        }
+    }
 }
 
 fn should_detach_for_terminal_launch() -> bool {
@@ -603,22 +734,11 @@ fn validate_profile_name(raw: &str) -> Result<String, String> {
 }
 
 fn validate_command_override(raw: &str) -> Result<String, String> {
-    let command = raw.trim();
-    if command.is_empty() {
-        return Err("command cannot be empty".to_string());
-    }
-    if command.len() > MAX_COMMAND_LENGTH {
-        return Err(format!(
-            "command is too long (max {MAX_COMMAND_LENGTH} characters)"
-        ));
-    }
-    if command.contains('\0') {
-        return Err("command contains invalid null bytes".to_string());
-    }
-
-    match shell_words::split(command) {
-        Ok(parts) if !parts.is_empty() => Ok(command.to_string()),
-        Ok(_) => Err("command cannot be empty".to_string()),
-        Err(err) => Err(format!("invalid -cmd/--command value: {err}")),
+    match validate_saved_command_text(raw) {
+        Ok(command) => Ok(command),
+        Err(err) if err.starts_with("invalid command: ") => {
+            Err(err.replacen("invalid command: ", "invalid -cmd/--command value: ", 1))
+        }
+        Err(err) => Err(err),
     }
 }

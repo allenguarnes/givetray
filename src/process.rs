@@ -1,6 +1,7 @@
+use crate::logs::profile_lock_action_blocked_message;
 use crate::{
-    config::clear_runtime_state, config::save_runtime_state, AppState, RuntimeOwnershipState,
-    UiEvent, BG_CHILD_ENV, RUNTIME_STOP_FAILED_MESSAGE,
+    coalesced_log_overflow_message, config::clear_runtime_state, config::save_runtime_state,
+    AppState, RuntimeOwnershipState, UiEvent, BG_CHILD_ENV, RUNTIME_STOP_FAILED_MESSAGE,
 };
 use async_channel::Sender;
 use gtk::prelude::*;
@@ -276,10 +277,48 @@ pub fn persist_launch_metadata_with_start_time(
     save_runtime_state(runtime_state_path, &state)
 }
 
+pub(crate) fn can_control_profile(owns_profile_lock: bool) -> bool {
+    owns_profile_lock
+}
+
+fn try_send_main_thread_event(ui_tx: &Sender<UiEvent>, event: UiEvent) -> bool {
+    match ui_tx.try_send(event) {
+        Ok(()) => true,
+        Err(async_channel::TrySendError::Full(_)) => false,
+        Err(async_channel::TrySendError::Closed(_)) => false,
+    }
+}
+
+fn flush_dropped_lines_blocking(ui_tx: &Sender<UiEvent>, dropped_lines: &mut usize) {
+    if *dropped_lines == 0 {
+        return;
+    }
+
+    if ui_tx
+        .send_blocking(UiEvent::AppendLog(coalesced_log_overflow_message(
+            *dropped_lines,
+        )))
+        .is_ok()
+    {
+        *dropped_lines = 0;
+    }
+}
+
 pub(crate) fn start_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>) {
+    if !can_control_profile(state.borrow().owns_profile_lock) {
+        let _ = try_send_main_thread_event(
+            &ui_tx,
+            UiEvent::AppendLog(profile_lock_action_blocked_message()),
+        );
+        return;
+    }
+
     let has_active_process = state.borrow().child.is_some() || state.borrow().owned_pgid.is_some();
     if has_active_process {
-        let _ = ui_tx.send_blocking(UiEvent::AppendLog("command is already running".to_string()));
+        let _ = try_send_main_thread_event(
+            &ui_tx,
+            UiEvent::AppendLog("command is already running".to_string()),
+        );
         return;
     }
 
@@ -287,32 +326,41 @@ pub(crate) fn start_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>
     let mut args = match shell_words::split(&command) {
         Ok(parts) if !parts.is_empty() => parts,
         Ok(_) => {
-            let _ = ui_tx.send_blocking(UiEvent::AppendLog("command is empty".to_string()));
+            let _ = try_send_main_thread_event(
+                &ui_tx,
+                UiEvent::AppendLog("command is empty".to_string()),
+            );
             return;
         }
         Err(err) => {
-            let _ = ui_tx.send_blocking(UiEvent::AppendLog(format!("command parse error: {err}")));
+            let _ = try_send_main_thread_event(
+                &ui_tx,
+                UiEvent::AppendLog(format!("command parse error: {err}")),
+            );
             return;
         }
     };
 
     let sudo_password = if is_sudo_command(&args) {
-        let needs_prompt = sudo_mode_needs_prompt(&args);
-        let password = if needs_prompt {
-            match prompt_sudo_password() {
-                Some(password) => Some(password),
-                None => {
-                    let _ = ui_tx.send_blocking(UiEvent::AppendLog(
-                        "sudo password prompt cancelled".to_string(),
-                    ));
-                    return;
+        match detect_sudo_mode(&args) {
+            Some(SudoMode::Plain) => {
+                ensure_sudo_stdin_flag(&mut args);
+                match prompt_sudo_password() {
+                    Some(password) => Some(password),
+                    None => {
+                        let _ = try_send_main_thread_event(
+                            &ui_tx,
+                            UiEvent::AppendLog("sudo password prompt cancelled".to_string()),
+                        );
+                        return;
+                    }
                 }
             }
-        } else {
-            None
-        };
-        ensure_sudo_stdin_flag(&mut args);
-        password
+            Some(SudoMode::Stdin) | Some(SudoMode::Askpass) | Some(SudoMode::NonInteractive) => {
+                None
+            }
+            None => None,
+        }
     } else {
         None
     };
@@ -321,7 +369,7 @@ pub(crate) fn start_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>
         match spawn_command_in_new_process_group(&args[0], &args[1..], sudo_password.is_some()) {
             Ok(result) => result,
             Err(err) => {
-                let _ = ui_tx.send_blocking(UiEvent::AppendLog(err));
+                let _ = try_send_main_thread_event(&ui_tx, UiEvent::AppendLog(err));
                 return;
             }
         };
@@ -332,14 +380,16 @@ pub(crate) fn start_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>
                 .write_all(password.as_bytes())
                 .and_then(|_| stdin.write_all(b"\n"))
             {
-                let _ = ui_tx.send_blocking(UiEvent::AppendLog(format!(
-                    "failed to send sudo password to process: {err}"
-                )));
+                let _ = try_send_main_thread_event(
+                    &ui_tx,
+                    UiEvent::AppendLog(format!("failed to send sudo password to process: {err}")),
+                );
             }
         } else {
-            let _ = ui_tx.send_blocking(UiEvent::AppendLog(
-                "unable to access sudo stdin pipe".to_string(),
-            ));
+            let _ = try_send_main_thread_event(
+                &ui_tx,
+                UiEvent::AppendLog("unable to access sudo stdin pipe".to_string()),
+            );
         }
     }
 
@@ -368,9 +418,10 @@ pub(crate) fn start_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>
         profile_name_owned,
         ephemeral,
     ) {
-        let _ = ui_tx.send_blocking(UiEvent::AppendLog(format!(
-            "failed to persist runtime state: {err}"
-        )));
+        let _ = try_send_main_thread_event(
+            &ui_tx,
+            UiEvent::AppendLog(format!("failed to persist runtime state: {err}")),
+        );
     }
 
     state.borrow_mut().child = Some(spawn_result.child);
@@ -378,11 +429,21 @@ pub(crate) fn start_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>
     state.borrow_mut().owned_pgid = Some(spawn_result.owned_pgid);
     state.borrow_mut().process_exit_reported = false;
 
-    let _ = ui_tx.send_blocking(UiEvent::SetRunning(true));
-    let _ = ui_tx.send_blocking(UiEvent::AppendLog("command started".to_string()));
+    if !try_send_main_thread_event(&ui_tx, UiEvent::SetRunning(true)) {
+        state.borrow().start_stop_item.set_text("Stop");
+    }
+    let _ = try_send_main_thread_event(&ui_tx, UiEvent::AppendLog("command started".to_string()));
 }
 
 pub(crate) fn stop_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>) {
+    if !can_control_profile(state.borrow().owns_profile_lock) {
+        let _ = try_send_main_thread_event(
+            &ui_tx,
+            UiEvent::AppendLog(profile_lock_action_blocked_message()),
+        );
+        return;
+    }
+
     let pgid = state.borrow().owned_pgid;
 
     if let Some(pgid) = pgid {
@@ -436,18 +497,40 @@ pub(crate) fn stop_command_blocking(state: Rc<RefCell<AppState>>) {
 fn spawn_reader<R: std::io::Read + Send + 'static>(reader: R, ui_tx: Sender<UiEvent>) {
     thread::spawn(move || {
         let buf = BufReader::new(reader);
+        let mut dropped_lines = 0usize;
+
         for line in buf.lines() {
             match line {
                 Ok(line) => {
-                    let _ = ui_tx.send_blocking(UiEvent::AppendLog(line));
+                    if dropped_lines > 0 {
+                        match ui_tx.try_send(UiEvent::AppendLog(coalesced_log_overflow_message(
+                            dropped_lines,
+                        ))) {
+                            Ok(()) => dropped_lines = 0,
+                            Err(async_channel::TrySendError::Full(_)) => {
+                                dropped_lines += 1;
+                                continue;
+                            }
+                            Err(async_channel::TrySendError::Closed(_)) => break,
+                        }
+                    }
+
+                    match ui_tx.try_send(UiEvent::AppendLog(line)) {
+                        Ok(()) => {}
+                        Err(async_channel::TrySendError::Full(_)) => dropped_lines += 1,
+                        Err(async_channel::TrySendError::Closed(_)) => break,
+                    }
                 }
                 Err(err) => {
-                    let _ =
-                        ui_tx.send_blocking(UiEvent::AppendLog(format!("log read error: {err}")));
+                    flush_dropped_lines_blocking(&ui_tx, &mut dropped_lines);
+
+                    let _ = ui_tx.try_send(UiEvent::AppendLog(format!("log read error: {err}")));
                     break;
                 }
             }
         }
+
+        flush_dropped_lines_blocking(&ui_tx, &mut dropped_lines);
     });
 }
 
@@ -458,18 +541,6 @@ pub(crate) enum SudoMode {
     NonInteractive,
 }
 
-fn parse_sudo_short_options(arg: &str) -> Option<SudoMode> {
-    for ch in arg.chars().skip(1) {
-        match ch {
-            'n' => return Some(SudoMode::NonInteractive),
-            'S' => return Some(SudoMode::Stdin),
-            'A' => return Some(SudoMode::Askpass),
-            _ => {}
-        }
-    }
-    None
-}
-
 pub(crate) fn detect_sudo_mode(args: &[String]) -> Option<SudoMode> {
     if args.is_empty() {
         return None;
@@ -477,24 +548,55 @@ pub(crate) fn detect_sudo_mode(args: &[String]) -> Option<SudoMode> {
 
     let first_arg = Path::new(&args[0]);
     let file_name = first_arg.file_name().and_then(|n| n.to_str());
-
     if file_name != Some("sudo") {
         return None;
     }
 
+    let mut skip_next = false;
     let mut i = 1;
     while i < args.len() {
-        match args[i].as_str() {
+        let arg = &args[i];
+
+        if skip_next {
+            skip_next = false;
+            i += 1;
+            continue;
+        }
+
+        if !arg.starts_with('-') {
+            break;
+        }
+
+        match arg.as_str() {
             "-n" | "--non-interactive" => return Some(SudoMode::NonInteractive),
             "-A" | "--askpass" => return Some(SudoMode::Askpass),
             "-S" | "--stdin" => return Some(SudoMode::Stdin),
-            arg if arg.starts_with('-') && arg.len() > 1 => {
+            "--" => break,
+            _ => {
                 if let Some(mode) = parse_sudo_short_options(arg) {
                     return Some(mode);
                 }
+                if arg.starts_with("--") {
+                    if let Some((flag, _)) = arg.split_once('=') {
+                        if sudo_option_takes_value(flag) {
+                            i += 1;
+                            continue;
+                        }
+                    }
+                    if sudo_option_takes_value(arg) {
+                        skip_next = true;
+                        i += 1;
+                        continue;
+                    }
+                } else if arg.len() == 2 && sudo_option_takes_value(arg) {
+                    skip_next = true;
+                    i += 1;
+                    continue;
+                } else if arg.len() > 2 && sudo_option_takes_value(&arg[..2]) {
+                    i += 1;
+                    continue;
+                }
             }
-            "--" => break,
-            _ => {}
         }
         i += 1;
     }
@@ -502,12 +604,56 @@ pub(crate) fn detect_sudo_mode(args: &[String]) -> Option<SudoMode> {
     Some(SudoMode::Plain)
 }
 
-pub(crate) fn sudo_mode_needs_prompt(args: &[String]) -> bool {
-    match detect_sudo_mode(args) {
-        Some(SudoMode::Plain) => true,
-        Some(SudoMode::Stdin) | Some(SudoMode::Askpass) | Some(SudoMode::NonInteractive) => false,
-        None => false,
+fn parse_sudo_short_options(arg: &str) -> Option<SudoMode> {
+    if !arg.starts_with('-') || arg.len() < 2 || arg.starts_with("--") {
+        return None;
     }
+    for ch in arg.chars().skip(1) {
+        if sudo_short_option_takes_value(ch) {
+            break;
+        }
+        match ch {
+            'n' => return Some(SudoMode::NonInteractive),
+            'A' => return Some(SudoMode::Askpass),
+            'S' => return Some(SudoMode::Stdin),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn sudo_short_option_takes_value(ch: char) -> bool {
+    matches!(
+        ch,
+        'C' | 'D' | 'R' | 'T' | 'U' | 'g' | 'h' | 'p' | 'r' | 't' | 'u'
+    )
+}
+
+fn sudo_option_takes_value(arg: &str) -> bool {
+    matches!(
+        arg,
+        "-C" | "-D"
+            | "-R"
+            | "-T"
+            | "-U"
+            | "-g"
+            | "-h"
+            | "-p"
+            | "-r"
+            | "-t"
+            | "-u"
+            | "--chdir"
+            | "--chroot"
+            | "--close-from"
+            | "--command-timeout"
+            | "--group"
+            | "--host"
+            | "--other-user"
+            | "--prompt"
+            | "--role"
+            | "--type"
+            | "--user"
+    )
 }
 
 fn is_sudo_command(args: &[String]) -> bool {
@@ -517,7 +663,7 @@ fn is_sudo_command(args: &[String]) -> bool {
         .is_some_and(|name| name == "sudo")
 }
 
-fn ensure_sudo_stdin_flag(args: &mut Vec<String>) {
+pub(crate) fn ensure_sudo_stdin_flag(args: &mut Vec<String>) {
     if args
         .iter()
         .any(|arg| arg == "-S" || arg == "--stdin" || arg == "--askpass")

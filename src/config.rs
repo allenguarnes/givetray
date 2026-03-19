@@ -1,16 +1,29 @@
 use crate::desktop::copy_icon_to_profile;
-use crate::logs::append_log;
+use crate::logs::{append_log, profile_lock_action_blocked_message};
 use crate::{
     AppState, CliOptions, Config, RuntimeOwnershipState, APP_NAME, DEFAULT_COMMAND,
-    DEFAULT_PROFILE, RUNTIME_INVALID_CLEARED_MESSAGE, RUNTIME_RESTORED_MESSAGE,
+    DEFAULT_PROFILE, MAX_COMMAND_LENGTH, RUNTIME_INVALID_CLEARED_MESSAGE, RUNTIME_RESTORED_MESSAGE,
     RUNTIME_STALE_CLEARED_MESSAGE,
 };
 use directories::ProjectDirs;
 use gtk::prelude::*;
 use std::cell::RefCell;
 use std::fs;
+use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+
+pub(crate) struct ProfileLockHandle {
+    // Keep the descriptor open so the advisory flock remains held.
+    pub(crate) lock_file: fs::File,
+}
+
+impl Drop for ProfileLockHandle {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::flock(self.lock_file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
 
 pub(crate) fn config_path_for_profile(profile: &str) -> Option<PathBuf> {
     ProjectDirs::from("com", APP_NAME, APP_NAME).map(|proj| {
@@ -74,15 +87,67 @@ pub(crate) fn load_or_create_config(path: &PathBuf) -> Config {
     }
 }
 
-pub(crate) fn save_config(path: &PathBuf, config: &Config) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| format!("failed to create config dir: {err}"))?;
-    }
-
+pub(crate) fn save_config(path: &Path, config: &Config) -> Result<(), String> {
     let payload = toml::to_string_pretty(config)
         .map_err(|err| format!("failed to serialize config: {err}"))?;
-    fs::write(path, payload).map_err(|err| format!("failed to write config: {err}"))?;
-    Ok(())
+    atomic_write(path, &payload).map_err(|err| format!("failed to write config: {err}"))
+}
+
+pub(crate) fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
+    let Some(parent) = path.parent() else {
+        return Err("file has no parent directory".to_string());
+    };
+
+    fs::create_dir_all(parent).map_err(|err| format!("failed to create directory: {err}"))?;
+    // Durability note: we sync only `parent` after rename. If create_dir_all had to
+    // create missing ancestors on first run, those ancestor directory entries may not
+    // be individually synced to their own parents before a crash.
+    let existing_permissions = path.metadata().ok().map(|metadata| metadata.permissions());
+    // Permission note: this preserves standard file permission bits via
+    // std::fs::Permissions, but not ownership, ACLs, or xattrs.
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("unknown");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let temp_path = parent.join(format!(".tmp.{file_name}.{}.{}", std::process::id(), nonce));
+
+    let write_result = (|| {
+        let mut file = fs::File::create(&temp_path)
+            .map_err(|err| format!("failed to create temp file: {err}"))?;
+        if let Some(permissions) = existing_permissions.as_ref() {
+            file.set_permissions(permissions.clone())
+                .map_err(|err| format!("failed to set temp file permissions: {err}"))?;
+        }
+        file.write_all(contents.as_bytes())
+            .map_err(|err| format!("failed to write temp file: {err}"))?;
+        file.sync_all()
+            .map_err(|err| format!("failed to sync temp file: {err}"))
+    })();
+
+    if let Err(err) = write_result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err);
+    }
+
+    fs::rename(&temp_path, path).map_err(|err| {
+        let _ = fs::remove_file(&temp_path);
+        format!("failed to rename temp file: {err}")
+    })?;
+
+    sync_directory(parent)
+}
+
+fn sync_directory(path: &Path) -> Result<(), String> {
+    let directory =
+        fs::File::open(path).map_err(|err| format!("failed to open directory for sync: {err}"))?;
+    directory
+        .sync_all()
+        .map_err(|err| format!("failed to sync directory: {err}"))
 }
 
 pub(crate) fn sanitize_profile_name(profile: &str) -> String {
@@ -101,6 +166,27 @@ pub(crate) fn sanitize_profile_name(profile: &str) -> String {
         cleaned = DEFAULT_PROFILE.to_string();
     }
     cleaned
+}
+
+pub(crate) fn validate_saved_command_text(raw: &str) -> Result<String, String> {
+    let command = raw.trim();
+    if command.is_empty() {
+        return Err("command cannot be empty".to_string());
+    }
+    if command.len() > MAX_COMMAND_LENGTH {
+        return Err(format!(
+            "command is too long (max {MAX_COMMAND_LENGTH} characters)"
+        ));
+    }
+    if command.contains('\0') {
+        return Err("command contains invalid null bytes".to_string());
+    }
+
+    match shell_words::split(command) {
+        Ok(parts) if !parts.is_empty() => Ok(command.to_string()),
+        Ok(_) => Err("command cannot be empty".to_string()),
+        Err(err) => Err(format!("invalid command: {err}")),
+    }
 }
 
 pub(crate) fn apply_cli_overrides_to_config(
@@ -156,12 +242,24 @@ pub(crate) fn save_configuration(
     log_to_file_enabled: bool,
 ) -> bool {
     let mut state = state.borrow_mut();
+    if !can_save_profile_configuration(state.owns_profile_lock) {
+        append_log(&mut state, profile_lock_action_blocked_message());
+        return false;
+    }
+
     let Some(access) = state.persistent_config_access.clone() else {
         append_log(
             &mut state,
             "configuration save is unavailable in ephemeral mode".to_string(),
         );
         return false;
+    };
+    let text = match validate_saved_command_text(&text) {
+        Ok(command) => command,
+        Err(err) => {
+            append_log(&mut state, err);
+            return false;
+        }
     };
     let new_autostart = state.config_autostart.is_active();
     let mut new_log_file_path = state.saved_log_file_path.clone();
@@ -213,6 +311,10 @@ pub(crate) fn save_configuration(
     true
 }
 
+pub(crate) fn can_save_profile_configuration(owns_profile_lock: bool) -> bool {
+    owns_profile_lock
+}
+
 pub(crate) fn runtime_state_path_for_profile(profile: &str) -> Option<PathBuf> {
     ProjectDirs::from("com", APP_NAME, APP_NAME).map(|proj| {
         proj.data_local_dir()
@@ -220,6 +322,41 @@ pub(crate) fn runtime_state_path_for_profile(profile: &str) -> Option<PathBuf> {
             .join("profiles")
             .join(format!("{}.toml", sanitize_profile_name(profile)))
     })
+}
+
+pub(crate) fn profile_lock_path_for_profile(profile: &str) -> Option<PathBuf> {
+    ProjectDirs::from("com", APP_NAME, APP_NAME).map(|proj| {
+        proj.data_local_dir()
+            .join("runtime")
+            .join("profiles")
+            .join(format!("{}.lock", sanitize_profile_name(profile)))
+    })
+}
+
+pub(crate) fn acquire_profile_lock(path: &Path) -> Result<ProfileLockHandle, String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| format!("failed to create lock dir: {err}"))?;
+    }
+
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|err| format!("failed to open profile lock file: {err}"))?;
+
+    let status = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if status != 0 {
+        let err = std::io::Error::last_os_error();
+        let raw_os_error = err.raw_os_error();
+        if raw_os_error == Some(libc::EWOULDBLOCK) || raw_os_error == Some(libc::EAGAIN) {
+            return Err("profile lock already held by another process".to_string());
+        }
+        return Err(format!("failed to acquire profile lock: {err}"));
+    }
+
+    Ok(ProfileLockHandle { lock_file: file })
 }
 
 pub(crate) fn runtime_state_path_for_ephemeral() -> Option<PathBuf> {
@@ -271,14 +408,9 @@ pub(crate) fn load_runtime_state(path: &Path) -> Option<RuntimeOwnershipState> {
 }
 
 pub(crate) fn save_runtime_state(path: &Path, state: &RuntimeOwnershipState) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| format!("failed to create runtime dir: {err}"))?;
-    }
-
     let payload = toml::to_string_pretty(state)
         .map_err(|err| format!("failed to serialize runtime state: {err}"))?;
-    fs::write(path, payload).map_err(|err| format!("failed to write runtime state: {err}"))?;
-    Ok(())
+    atomic_write(path, &payload).map_err(|err| format!("failed to write runtime state: {err}"))
 }
 
 pub(crate) fn clear_runtime_state(path: &Path) -> Result<(), String> {

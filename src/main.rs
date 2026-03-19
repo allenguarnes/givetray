@@ -11,7 +11,7 @@ use crate::cli::{
     parse_cli_args, prepare_run_startup, should_expose_configuration, tray_tooltip,
     validate_runtime_mode,
 };
-use crate::config::reconcile_startup_runtime_state;
+use crate::config::{reconcile_startup_runtime_state, ProfileLockHandle};
 use crate::desktop::{create_desktop_file_from_cli, load_tray_icon, load_window_icon_pixbuf};
 use crate::logs::{build_logs_window, setup_log_receiver, setup_logs_handlers};
 use crate::process::start_command;
@@ -65,6 +65,7 @@ const APP_NAME: &str = "givetray";
 const DEFAULT_PROFILE: &str = "default";
 const DEFAULT_COMMAND: &str = "echo configure command";
 const MAX_LOG_LINES: usize = 5000;
+const UI_EVENT_CHANNEL_CAPACITY: usize = 750;
 const MAX_UNDO: usize = 200;
 const MAX_COMMAND_LENGTH: usize = 8192;
 const MAX_PROFILE_LENGTH: usize = 128;
@@ -78,6 +79,12 @@ const RUNTIME_STALE_CLEARED_MESSAGE: &str = "cleared stale runtime state from pr
 const RUNTIME_INVALID_CLEARED_MESSAGE: &str = "cleared invalid runtime state from previous session";
 const RUNTIME_STOP_FAILED_MESSAGE: &str =
     "failed to stop managed process group; process may still be running";
+const RUNTIME_ALREADY_OPEN_MESSAGE: &str = "profile already open";
+
+pub(crate) fn coalesced_log_overflow_message(count: usize) -> String {
+    let suffix = if count == 1 { "" } else { "s" };
+    format!("log queue saturated; dropped {count} line{suffix}")
+}
 
 #[derive(Debug, Clone)]
 struct CliOptions {
@@ -153,6 +160,8 @@ struct AppState {
     process_exit_reported: bool,
     runtime_state_path: Option<PathBuf>,
     restored_running: bool,
+    owns_profile_lock: bool,
+    profile_lock: Option<ProfileLockHandle>,
     log_lines: VecDeque<String>,
     log_links: VecDeque<Vec<LogLink>>,
     log_file_path: Option<PathBuf>,
@@ -211,6 +220,8 @@ struct StartupState {
     runtime_state_path: Option<PathBuf>,
     runtime_ownership: Option<RuntimeOwnershipState>,
     restored_running: bool,
+    owns_profile_lock: bool,
+    profile_lock: Option<ProfileLockHandle>,
     startup_message: Option<String>,
 }
 
@@ -312,7 +323,7 @@ fn main() {
         about_window.set_icon(Some(icon));
     }
 
-    let (ui_tx, ui_rx) = async_channel::unbounded::<UiEvent>();
+    let (ui_tx, ui_rx) = async_channel::bounded::<UiEvent>(UI_EVENT_CHANNEL_CAPACITY);
 
     let start_stop_id = MenuId::new("start-stop");
     let logs_id = MenuId::new("logs");
@@ -372,6 +383,8 @@ fn main() {
         process_exit_reported: false,
         runtime_state_path: startup.runtime_state_path,
         restored_running: startup.restored_running,
+        owns_profile_lock: startup.owns_profile_lock,
+        profile_lock: startup.profile_lock,
         log_lines: VecDeque::new(),
         log_links: VecDeque::new(),
         log_file_path: startup.log_file_path,
@@ -400,6 +413,11 @@ fn main() {
         config_ignore: false,
         start_stop_item,
     }));
+
+    {
+        let app = state.borrow();
+        debug_assert!(app.owns_profile_lock || app.profile_lock.is_none());
+    }
 
     if let Some(message) = startup_message {
         logs::append_log(&mut state.borrow_mut(), message);
