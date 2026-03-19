@@ -2055,6 +2055,32 @@ mod sudo_mode_detection {
         assert!(matches!(mode, Some(SudoMode::NonInteractive)));
         assert!(!needs_password(&args));
     }
+
+    #[test]
+    fn sudo_attached_long_option_value_before_n() {
+        let args = vec![
+            "sudo".to_string(),
+            "--user=root".to_string(),
+            "-n".to_string(),
+            "echo".to_string(),
+        ];
+        let mode = detect_sudo_mode(&args);
+        assert!(matches!(mode, Some(SudoMode::NonInteractive)));
+        assert!(!needs_password(&args));
+    }
+
+    #[test]
+    fn sudo_attached_short_option_value_before_n() {
+        let args = vec![
+            "sudo".to_string(),
+            "-uroot".to_string(),
+            "-n".to_string(),
+            "echo".to_string(),
+        ];
+        let mode = detect_sudo_mode(&args);
+        assert!(matches!(mode, Some(SudoMode::NonInteractive)));
+        assert!(!needs_password(&args));
+    }
 }
 
 mod sudo_stdin_injection {

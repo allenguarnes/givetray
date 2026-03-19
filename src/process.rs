@@ -579,7 +579,6 @@ pub(crate) fn detect_sudo_mode(args: &[String]) -> Option<SudoMode> {
                 if arg.starts_with("--") {
                     if let Some((flag, _)) = arg.split_once('=') {
                         if sudo_option_takes_value(flag) {
-                            skip_next = true;
                             i += 1;
                             continue;
                         }
@@ -589,10 +588,11 @@ pub(crate) fn detect_sudo_mode(args: &[String]) -> Option<SudoMode> {
                         i += 1;
                         continue;
                     }
-                } else if (arg.len() == 2 && sudo_option_takes_value(arg))
-                    || (arg.len() > 2 && sudo_option_takes_value(&arg[..2]))
-                {
+                } else if arg.len() == 2 && sudo_option_takes_value(arg) {
                     skip_next = true;
+                    i += 1;
+                    continue;
+                } else if arg.len() > 2 && sudo_option_takes_value(&arg[..2]) {
                     i += 1;
                     continue;
                 }
