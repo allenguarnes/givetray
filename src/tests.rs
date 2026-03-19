@@ -1547,3 +1547,44 @@ mod stop_process_group {
         assert!(!stopped, "stop should return false for zero pgid");
     }
 }
+
+mod sudo_mode_detection {
+    use crate::process::{detect_sudo_mode, sudo_mode_needs_prompt, SudoMode};
+
+    #[test]
+    fn sudo_askpass_mode_skips_stdin_injection() {
+        let args = vec!["sudo".to_string(), "-A".to_string(), "echo".to_string()];
+        let mode = detect_sudo_mode(&args);
+        assert!(matches!(mode, Some(SudoMode::Askpass)));
+    }
+
+    #[test]
+    fn sudo_noninteractive_mode_skips_password_prompt() {
+        let args = vec!["sudo".to_string(), "-n".to_string(), "echo".to_string()];
+        assert!(!sudo_mode_needs_prompt(&args));
+    }
+
+    #[test]
+    fn sudo_plain_mode_needs_password() {
+        let args = vec!["sudo".to_string(), "echo".to_string()];
+        assert!(sudo_mode_needs_prompt(&args));
+    }
+
+    #[test]
+    fn sudo_stdin_mode_skips_password_prompt() {
+        let args = vec!["sudo".to_string(), "-S".to_string(), "echo".to_string()];
+        assert!(!sudo_mode_needs_prompt(&args));
+    }
+
+    #[test]
+    fn non_sudo_command_returns_none() {
+        let args = vec!["echo".to_string(), "hello".to_string()];
+        assert!(detect_sudo_mode(&args).is_none());
+    }
+
+    #[test]
+    fn empty_args_returns_none() {
+        let args: Vec<String> = vec![];
+        assert!(detect_sudo_mode(&args).is_none());
+    }
+}

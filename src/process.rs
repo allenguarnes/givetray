@@ -298,14 +298,18 @@ pub(crate) fn start_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>
 
     let sudo_password = if is_sudo_command(&args) {
         ensure_sudo_stdin_flag(&mut args);
-        match prompt_sudo_password() {
-            Some(password) => Some(password),
-            None => {
-                let _ = ui_tx.send_blocking(UiEvent::AppendLog(
-                    "sudo password prompt cancelled".to_string(),
-                ));
-                return;
+        if sudo_mode_needs_prompt(&args) {
+            match prompt_sudo_password() {
+                Some(password) => Some(password),
+                None => {
+                    let _ = ui_tx.send_blocking(UiEvent::AppendLog(
+                        "sudo password prompt cancelled".to_string(),
+                    ));
+                    return;
+                }
             }
+        } else {
+            None
         }
     } else {
         None
@@ -443,6 +447,41 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(reader: R, ui_tx: Sender<UiEv
             }
         }
     });
+}
+
+pub(crate) enum SudoMode {
+    Plain,
+    Stdin,
+    Askpass,
+    NonInteractive,
+}
+
+pub(crate) fn detect_sudo_mode(args: &[String]) -> Option<SudoMode> {
+    if args.is_empty() || args[0] != "sudo" {
+        return None;
+    }
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-n" | "--non-interactive" => return Some(SudoMode::NonInteractive),
+            "-A" | "--askpass" => return Some(SudoMode::Askpass),
+            "-S" | "--stdin" => return Some(SudoMode::Stdin),
+            "--" => break,
+            _ => {}
+        }
+        i += 1;
+    }
+
+    Some(SudoMode::Plain)
+}
+
+pub(crate) fn sudo_mode_needs_prompt(args: &[String]) -> bool {
+    match detect_sudo_mode(args) {
+        Some(SudoMode::Plain) => true,
+        Some(SudoMode::Stdin) | Some(SudoMode::Askpass) | Some(SudoMode::NonInteractive) => false,
+        None => false,
+    }
 }
 
 fn is_sudo_command(args: &[String]) -> bool {
