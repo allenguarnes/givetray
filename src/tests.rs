@@ -2081,6 +2081,34 @@ mod sudo_mode_detection {
         assert!(matches!(mode, Some(SudoMode::NonInteractive)));
         assert!(!needs_password(&args));
     }
+
+    #[test]
+    fn sudo_short_bundle_with_u_attached_value_is_plain() {
+        let args = vec!["sudo".to_string(), "-uann".to_string(), "echo".to_string()];
+        let mode = detect_sudo_mode(&args);
+        assert!(matches!(mode, Some(SudoMode::Plain)));
+        assert!(needs_password(&args));
+    }
+
+    #[test]
+    fn sudo_short_bundle_with_p_attached_value_is_plain() {
+        let args = vec![
+            "sudo".to_string(),
+            "-pSecret".to_string(),
+            "echo".to_string(),
+        ];
+        let mode = detect_sudo_mode(&args);
+        assert!(matches!(mode, Some(SudoMode::Plain)));
+        assert!(needs_password(&args));
+    }
+
+    #[test]
+    fn sudo_short_bundle_preserves_flags_before_value_taker() {
+        let args = vec!["sudo".to_string(), "-nuann".to_string(), "echo".to_string()];
+        let mode = detect_sudo_mode(&args);
+        assert!(matches!(mode, Some(SudoMode::NonInteractive)));
+        assert!(!needs_password(&args));
+    }
 }
 
 mod sudo_stdin_injection {

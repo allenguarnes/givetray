@@ -609,6 +609,9 @@ fn parse_sudo_short_options(arg: &str) -> Option<SudoMode> {
         return None;
     }
     for ch in arg.chars().skip(1) {
+        if sudo_short_option_takes_value(ch) {
+            break;
+        }
         match ch {
             'n' => return Some(SudoMode::NonInteractive),
             'A' => return Some(SudoMode::Askpass),
@@ -617,6 +620,13 @@ fn parse_sudo_short_options(arg: &str) -> Option<SudoMode> {
         }
     }
     None
+}
+
+fn sudo_short_option_takes_value(ch: char) -> bool {
+    matches!(
+        ch,
+        'C' | 'D' | 'R' | 'T' | 'U' | 'g' | 'h' | 'p' | 'r' | 't' | 'u'
+    )
 }
 
 fn sudo_option_takes_value(arg: &str) -> bool {
