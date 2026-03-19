@@ -297,8 +297,8 @@ pub(crate) fn start_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>
     };
 
     let sudo_password = if is_sudo_command(&args) {
-        ensure_sudo_stdin_flag(&mut args);
-        if sudo_mode_needs_prompt(&args) {
+        let needs_prompt = sudo_mode_needs_prompt(&args);
+        let password = if needs_prompt {
             match prompt_sudo_password() {
                 Some(password) => Some(password),
                 None => {
@@ -310,7 +310,9 @@ pub(crate) fn start_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>
             }
         } else {
             None
-        }
+        };
+        ensure_sudo_stdin_flag(&mut args);
+        password
     } else {
         None
     };
@@ -456,8 +458,27 @@ pub(crate) enum SudoMode {
     NonInteractive,
 }
 
+fn parse_sudo_short_options(arg: &str) -> Option<SudoMode> {
+    for ch in arg.chars().skip(1) {
+        match ch {
+            'n' => return Some(SudoMode::NonInteractive),
+            'S' => return Some(SudoMode::Stdin),
+            'A' => return Some(SudoMode::Askpass),
+            _ => {}
+        }
+    }
+    None
+}
+
 pub(crate) fn detect_sudo_mode(args: &[String]) -> Option<SudoMode> {
-    if args.is_empty() || args[0] != "sudo" {
+    if args.is_empty() {
+        return None;
+    }
+
+    let first_arg = Path::new(&args[0]);
+    let file_name = first_arg.file_name().and_then(|n| n.to_str());
+
+    if file_name != Some("sudo") {
         return None;
     }
 
@@ -467,6 +488,11 @@ pub(crate) fn detect_sudo_mode(args: &[String]) -> Option<SudoMode> {
             "-n" | "--non-interactive" => return Some(SudoMode::NonInteractive),
             "-A" | "--askpass" => return Some(SudoMode::Askpass),
             "-S" | "--stdin" => return Some(SudoMode::Stdin),
+            arg if arg.starts_with('-') && arg.len() > 1 => {
+                if let Some(mode) = parse_sudo_short_options(arg) {
+                    return Some(mode);
+                }
+            }
             "--" => break,
             _ => {}
         }

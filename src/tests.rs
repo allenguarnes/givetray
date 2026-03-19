@@ -1587,4 +1587,36 @@ mod sudo_mode_detection {
         let args: Vec<String> = vec![];
         assert!(detect_sudo_mode(&args).is_none());
     }
+
+    #[test]
+    fn sudo_with_absolute_path_detected() {
+        let args = vec!["/usr/bin/sudo".to_string(), "echo".to_string()];
+        let mode = detect_sudo_mode(&args);
+        assert!(matches!(mode, Some(SudoMode::Plain)));
+        assert!(sudo_mode_needs_prompt(&args));
+    }
+
+    #[test]
+    fn sudo_bundled_option_sn_returns_stdin() {
+        let args = vec!["sudo".to_string(), "-Sn".to_string(), "echo".to_string()];
+        let mode = detect_sudo_mode(&args);
+        assert!(matches!(mode, Some(SudoMode::Stdin)));
+        assert!(!sudo_mode_needs_prompt(&args));
+    }
+
+    #[test]
+    fn sudo_bundled_option_an_returns_askpass() {
+        let args = vec!["sudo".to_string(), "-An".to_string(), "echo".to_string()];
+        let mode = detect_sudo_mode(&args);
+        assert!(matches!(mode, Some(SudoMode::Askpass)));
+        assert!(!sudo_mode_needs_prompt(&args));
+    }
+
+    #[test]
+    fn sudo_bundled_option_as_returns_askpass() {
+        let args = vec!["sudo".to_string(), "-AS".to_string(), "echo".to_string()];
+        let mode = detect_sudo_mode(&args);
+        assert!(matches!(mode, Some(SudoMode::Askpass)));
+        assert!(!sudo_mode_needs_prompt(&args));
+    }
 }
