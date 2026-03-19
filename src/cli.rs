@@ -56,7 +56,7 @@ pub(crate) fn detach_to_background_if_needed(cli: &CliOptions) -> Result<(), Str
         .spawn()
         .map_err(|err| format!("unable to spawn detached process: {err}"))?;
 
-    thread::sleep(Duration::from_millis(120));
+    thread::sleep(Duration::from_millis(500));
     if let Ok(Some(status)) = child.try_wait() {
         return Err(format!("detached process exited early: {status}"));
     }
