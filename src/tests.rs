@@ -1946,4 +1946,22 @@ mod sudo_mode_detection {
         let args: Vec<String> = vec![];
         assert!(detect_sudo_mode(&args).is_none());
     }
+
+    #[test]
+    fn sudo_absolute_path_needs_password() {
+        let args = vec!["/usr/bin/sudo".to_string(), "echo".to_string()];
+        assert!(sudo_mode_needs_prompt(&args));
+    }
+
+    #[test]
+    fn sudo_short_option_bundle_an() {
+        let args = vec!["sudo".to_string(), "-An".to_string(), "echo".to_string()];
+        assert!(!sudo_mode_needs_prompt(&args));
+    }
+
+    #[test]
+    fn sudo_short_option_bundle_sn() {
+        let args = vec!["sudo".to_string(), "-Sn".to_string(), "echo".to_string()];
+        assert!(!sudo_mode_needs_prompt(&args));
+    }
 }
