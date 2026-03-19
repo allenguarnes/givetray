@@ -144,13 +144,13 @@ When saving configuration, commands are validated for:
 
 - Non-empty text
 - Length within limits
-- Valid shell syntax
+- Valid quoted command line (use `sh -lc "..."` for shell features like pipes or redirects)
 
 Invalid commands are rejected with an error message.
 
 ### Atomic Writes
 
-Configuration, runtime state, and desktop files are written atomically to prevent corruption from crashes or power loss.
+Configuration, runtime state, and desktop files are written atomically to reduce corruption risk.
 
 ## Sudo Behavior
 
@@ -158,7 +158,7 @@ Password prompting is mode-aware when the configured command starts with `sudo`:
 
 - Plain `sudo` prompts for password via GTK dialog
 - `sudo -n`, `sudo -A`, `sudo --askpass` skip the password prompt
-- `sudo -S`, `sudo --stdin` reads from stdin and does not prompt
+- `sudo -S`, `sudo --stdin` are externally managed; `givetray` does not inject a password via stdin
 
 Passwords are never stored in config.
 
