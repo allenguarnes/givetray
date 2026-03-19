@@ -6,8 +6,8 @@ use crate::cli::{
 };
 use crate::config::config_path_for_profile;
 use crate::config::{
-    acquire_profile_lock, can_save_profile_configuration, clear_runtime_state, load_runtime_state,
-    profile_lock_path_for_profile, reconcile_startup_runtime_state,
+    acquire_profile_lock, atomic_write, can_save_profile_configuration, clear_runtime_state,
+    load_runtime_state, profile_lock_path_for_profile, reconcile_startup_runtime_state,
     runtime_state_path_for_ephemeral, runtime_state_path_for_profile, save_config,
     save_runtime_state,
 };
@@ -965,6 +965,23 @@ fn save_and_load_runtime_state() {
     assert_eq!(loaded.pid, 9999);
     assert_eq!(loaded.pgid, 9999);
     assert_eq!(loaded.profile_name.as_deref(), Some("testprofile"));
+}
+
+#[test]
+fn atomic_write_replaces_existing_file_contents() {
+    let temp_dir = unique_test_dir("atomic-write-test");
+    fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+    let file_path = temp_dir.join("test.txt");
+
+    let old_contents = "old contents\nmultiple lines\n";
+    fs::write(&file_path, old_contents).expect("should write old contents");
+
+    let new_contents = "new contents\n";
+    let result = atomic_write(&file_path, new_contents);
+    assert!(result.is_ok(), "atomic_write should succeed");
+
+    let read_back = fs::read_to_string(&file_path).expect("should read file");
+    assert_eq!(read_back, new_contents);
 }
 
 #[test]

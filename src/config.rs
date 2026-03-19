@@ -9,6 +9,7 @@ use directories::ProjectDirs;
 use gtk::prelude::*;
 use std::cell::RefCell;
 use std::fs;
+use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -86,15 +87,47 @@ pub(crate) fn load_or_create_config(path: &PathBuf) -> Config {
     }
 }
 
-pub(crate) fn save_config(path: &PathBuf, config: &Config) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| format!("failed to create config dir: {err}"))?;
-    }
-
+pub(crate) fn save_config(path: &Path, config: &Config) -> Result<(), String> {
     let payload = toml::to_string_pretty(config)
         .map_err(|err| format!("failed to serialize config: {err}"))?;
-    fs::write(path, payload).map_err(|err| format!("failed to write config: {err}"))?;
-    Ok(())
+    atomic_write(path, &payload).map_err(|err| format!("failed to write config: {err}"))
+}
+
+pub(crate) fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
+    let Some(parent) = path.parent() else {
+        return Err("file has no parent directory".to_string());
+    };
+
+    fs::create_dir_all(parent).map_err(|err| format!("failed to create directory: {err}"))?;
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("unknown");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let temp_path = parent.join(format!(".tmp.{file_name}.{}.{}", std::process::id(), nonce));
+
+    let write_result = (|| {
+        let mut file = fs::File::create(&temp_path)
+            .map_err(|err| format!("failed to create temp file: {err}"))?;
+        file.write_all(contents.as_bytes())
+            .map_err(|err| format!("failed to write temp file: {err}"))?;
+        file.sync_all()
+            .map_err(|err| format!("failed to sync temp file: {err}"))
+    })();
+
+    if let Err(err) = write_result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err);
+    }
+
+    fs::rename(&temp_path, path).map_err(|err| {
+        let _ = fs::remove_file(&temp_path);
+        format!("failed to rename temp file: {err}")
+    })
 }
 
 pub(crate) fn sanitize_profile_name(profile: &str) -> String {
@@ -327,14 +360,9 @@ pub(crate) fn load_runtime_state(path: &Path) -> Option<RuntimeOwnershipState> {
 }
 
 pub(crate) fn save_runtime_state(path: &Path, state: &RuntimeOwnershipState) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| format!("failed to create runtime dir: {err}"))?;
-    }
-
     let payload = toml::to_string_pretty(state)
         .map_err(|err| format!("failed to serialize runtime state: {err}"))?;
-    fs::write(path, payload).map_err(|err| format!("failed to write runtime state: {err}"))?;
-    Ok(())
+    atomic_write(path, &payload).map_err(|err| format!("failed to write runtime state: {err}"))
 }
 
 pub(crate) fn clear_runtime_state(path: &Path) -> Result<(), String> {

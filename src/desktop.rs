@@ -1,5 +1,5 @@
 use crate::config::{
-    apply_cli_overrides_to_config, config_path_for_profile, load_or_create_config,
+    apply_cli_overrides_to_config, atomic_write, config_path_for_profile, load_or_create_config,
     sanitize_profile_name, save_config,
 };
 use crate::logs::append_log;
@@ -323,9 +323,6 @@ fn desktop_escape_arg(value: &str) -> String {
     escaped
 }
 
-fn write_desktop_file(path: &PathBuf, contents: &str) -> Result<(), std::io::Error> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, contents)
+fn write_desktop_file(path: &Path, contents: &str) -> Result<(), String> {
+    atomic_write(path, contents)
 }
