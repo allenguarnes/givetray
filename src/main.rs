@@ -171,6 +171,9 @@ struct AppState {
     logs_buffer: gtk::TextBuffer,
     logs_clear_button: gtk::Button,
     logs_copy_button: gtk::Button,
+    logs_start_button: gtk::Button,
+    logs_stop_button: gtk::Button,
+    logs_restart_button: gtk::Button,
     logs_status_label: gtk::Label,
     about_window: gtk::Window,
     config_window: gtk::Window,
@@ -297,6 +300,9 @@ fn main() {
         logs_buffer,
         logs_clear_button,
         logs_copy_button,
+        logs_start_button,
+        logs_stop_button,
+        logs_restart_button,
         logs_status_label,
     ) = build_logs_window();
     let (
@@ -394,6 +400,9 @@ fn main() {
         logs_buffer,
         logs_clear_button,
         logs_copy_button,
+        logs_start_button,
+        logs_stop_button,
+        logs_restart_button,
         logs_status_label,
         about_window,
         config_window,
@@ -434,7 +443,7 @@ fn main() {
         refresh_desktop_toggles(state.clone(), &apps_toggle, &system_autostart_toggle);
         setup_config_handlers(state.clone());
     }
-    setup_logs_handlers(state.clone());
+    setup_logs_handlers(state.clone(), ui_tx.clone());
     setup_log_receiver(state.clone(), ui_rx);
     setup_menu_polling(state.clone(), ui_tx.clone());
     setup_process_watcher(state.clone(), ui_tx.clone());

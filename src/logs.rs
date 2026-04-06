@@ -2,8 +2,13 @@ use crate::{
     config::clear_runtime_state, AppState, LogLink, PendingLogLink, UiEvent, LOG_LINK_CLICK_SLOP,
     LOG_LINK_TAG_NAME, MAX_LOG_LINES,
 };
-use async_channel::Receiver;
-use glib::{MainContext, Propagation};
+use crate::process::{start_command, stop_command};
+use async_channel::{Receiver, Sender};
+use glib::{ControlFlow, MainContext, Propagation};
+use std::time::Duration;
+
+const RESTART_CHECK_INTERVAL_MS: u64 = 500;
+const MAX_RESTART_ATTEMPTS: u32 = 20;
 use gtk::gdk;
 use gtk::prelude::*;
 use std::fs::{self, File};
@@ -30,6 +35,9 @@ pub(crate) fn build_logs_window() -> (
     gtk::Window,
     gtk::TextView,
     gtk::TextBuffer,
+    gtk::Button,
+    gtk::Button,
+    gtk::Button,
     gtk::Button,
     gtk::Button,
     gtk::Label,
@@ -78,6 +86,30 @@ pub(crate) fn build_logs_window() -> (
     copy_box.pack_start(&copy_label, false, false, 0);
     copy_button.add(&copy_box);
 
+    let start_button = gtk::Button::new();
+    let start_icon = gtk::Image::from_icon_name(Some("media-playback-start"), gtk::IconSize::Button);
+    let start_label = gtk::Label::new(Some("Start"));
+    let start_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    start_box.pack_start(&start_icon, false, false, 0);
+    start_box.pack_start(&start_label, false, false, 0);
+    start_button.add(&start_box);
+
+    let stop_button = gtk::Button::new();
+    let stop_icon = gtk::Image::from_icon_name(Some("media-playback-stop"), gtk::IconSize::Button);
+    let stop_label = gtk::Label::new(Some("Stop"));
+    let stop_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    stop_box.pack_start(&stop_icon, false, false, 0);
+    stop_box.pack_start(&stop_label, false, false, 0);
+    stop_button.add(&stop_box);
+
+    let restart_button = gtk::Button::new();
+    let restart_icon = gtk::Image::from_icon_name(Some("view-refresh"), gtk::IconSize::Button);
+    let restart_label = gtk::Label::new(Some("Restart"));
+    let restart_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    restart_box.pack_start(&restart_icon, false, false, 0);
+    restart_box.pack_start(&restart_label, false, false, 0);
+    restart_button.add(&restart_box);
+
     let status_label = gtk::Label::new(Some("0 lines"));
     status_label.set_halign(gtk::Align::Start);
     status_label.set_xalign(0.0);
@@ -89,6 +121,9 @@ pub(crate) fn build_logs_window() -> (
     actions.set_margin_top(8);
     actions.set_margin_bottom(4);
     actions.pack_start(&status_label, true, true, 0);
+    actions.pack_start(&start_button, false, false, 0);
+    actions.pack_start(&stop_button, false, false, 0);
+    actions.pack_start(&restart_button, false, false, 0);
     actions.pack_start(&copy_button, false, false, 0);
     actions.pack_start(&clear_button, false, false, 0);
 
@@ -118,13 +153,19 @@ pub(crate) fn build_logs_window() -> (
         buffer,
         clear_button,
         copy_button,
+        start_button,
+        stop_button,
+        restart_button,
         status_label,
     )
 }
 
-pub(crate) fn setup_logs_handlers(state: Rc<RefCell<AppState>>) {
+pub(crate) fn setup_logs_handlers(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>) {
     let clear_button = state.borrow().logs_clear_button.clone();
     let copy_button = state.borrow().logs_copy_button.clone();
+    let start_button = state.borrow().logs_start_button.clone();
+    let stop_button = state.borrow().logs_stop_button.clone();
+    let restart_button = state.borrow().logs_restart_button.clone();
     let buffer = state.borrow().logs_buffer.clone();
     let text_view = state.borrow().logs_view.clone();
     let status_label = state.borrow().logs_status_label.clone();
@@ -150,6 +191,66 @@ pub(crate) fn setup_logs_handlers(state: Rc<RefCell<AppState>>) {
         clipboard.set_text(&text);
         let line_count = state_copy.borrow().log_lines.len();
         set_logs_status(&status_copy, line_count, Some("copied"));
+    });
+
+    let state_start = state.clone();
+    let ui_tx_start = ui_tx.clone();
+    start_button.connect_clicked(move |_| {
+        let state_ref = state_start.borrow();
+        state_ref.logs_start_button.set_sensitive(false);
+        state_ref.logs_stop_button.set_sensitive(false);
+        drop(state_ref);
+        start_command(state_start.clone(), ui_tx_start.clone());
+    });
+
+    let state_stop = state.clone();
+    let ui_tx_stop = ui_tx.clone();
+    stop_button.connect_clicked(move |_| {
+        let state_ref = state_stop.borrow();
+        state_ref.logs_start_button.set_sensitive(false);
+        state_ref.logs_stop_button.set_sensitive(false);
+        drop(state_ref);
+        stop_command(state_stop.clone(), ui_tx_stop.clone());
+    });
+
+    let state_restart = state.clone();
+    let ui_tx_restart = ui_tx.clone();
+    restart_button.connect_clicked(move |_| {
+        let initial_running = {
+            let state_ref = state_restart.borrow();
+            state_ref.child.is_some() || state_ref.owned_pgid.is_some()
+        };
+
+        if initial_running {
+            stop_command(state_restart.clone(), ui_tx_restart.clone());
+
+            let state_restart_delayed = state_restart.clone();
+            let ui_tx_restart_delayed = ui_tx_restart.clone();
+            let mut attempts = 0;
+
+            glib::timeout_add_local(Duration::from_millis(RESTART_CHECK_INTERVAL_MS), move || {
+                attempts += 1;
+                let running = {
+                    let state = state_restart_delayed.borrow();
+                    state.child.is_some() || state.owned_pgid.is_some()
+                };
+                if !running {
+                    start_command(state_restart_delayed.clone(), ui_tx_restart_delayed.clone());
+                    set_logs_button_states(&state_restart_delayed.borrow());
+                    ControlFlow::Break
+                } else if attempts >= MAX_RESTART_ATTEMPTS {
+                    let _ = ui_tx_restart_delayed.try_send(UiEvent::AppendLog(
+                        "restart failed: command did not stop in time".to_string()
+                    ));
+                    ControlFlow::Break
+                } else {
+                    ControlFlow::Continue
+                }
+            });
+        } else {
+            start_command(state_restart.clone(), ui_tx_restart.clone());
+            set_logs_button_states(&state_restart.borrow());
+        }
     });
 
     let pending_press = pending_link.clone();
@@ -250,6 +351,8 @@ pub(crate) fn setup_logs_handlers(state: Rc<RefCell<AppState>>) {
         set_logs_link_cursor(text_view, false);
         Propagation::Proceed
     });
+
+    set_logs_button_states(&state.borrow());
 }
 
 pub(crate) fn set_logs_status(label: &gtk::Label, line_count: usize, detail: Option<&str>) {
@@ -276,6 +379,8 @@ pub(crate) fn apply_process_exited(state: &mut AppState, code: Option<i32>) {
     state.child = None;
     state.process_exit_reported = true;
 
+    set_logs_button_states(state);
+
     let msg = match code {
         Some(code) => format!("command exited with code {code}"),
         None => "command exited".to_string(),
@@ -296,6 +401,12 @@ pub(crate) fn apply_clear_runtime_state(state: &mut AppState) {
     state.owned_pid = None;
 }
 
+fn set_logs_button_states(state: &AppState) {
+    let running = state.child.is_some() || state.owned_pgid.is_some();
+    state.logs_start_button.set_sensitive(!running);
+    state.logs_stop_button.set_sensitive(running);
+}
+
 pub(crate) fn setup_log_receiver(state: Rc<RefCell<AppState>>, receiver: Receiver<UiEvent>) {
     MainContext::default().spawn_local(async move {
         while let Ok(event) = receiver.recv().await {
@@ -304,6 +415,7 @@ pub(crate) fn setup_log_receiver(state: Rc<RefCell<AppState>>, receiver: Receive
                 UiEvent::AppendLog(line) => append_log(&mut state, line),
                 UiEvent::ProcessExited(code) => apply_process_exited(&mut state, code),
                 UiEvent::SetRunning(running) => {
+                    set_logs_button_states(&state);
                     state
                         .start_stop_item
                         .set_text(if running { "Stop" } else { "Start" });
