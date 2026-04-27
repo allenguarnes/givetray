@@ -1,11 +1,14 @@
 use crate::cli::{should_expose_configuration, tray_tooltip};
 use crate::config::save_configuration;
-use crate::desktop::{applications_desktop_path, apply_desktop_actions, autostart_desktop_path};
+use crate::desktop::{
+    applications_entry_is_visible, apply_desktop_actions, autostart_desktop_path,
+};
 use crate::logs::{
     append_log, apply_process_exited, buffer_text, logs_window_title,
     profile_lock_action_blocked_message,
 };
 use crate::process::{can_control_profile, start_command, stop_command, stop_command_blocking};
+use crate::tray::TrayAction;
 use crate::{AppState, ConfigCloseAction, UiEvent, MAX_UNDO};
 use async_channel::Sender;
 use glib::{ControlFlow, LogLevels, Propagation};
@@ -15,8 +18,6 @@ use gtk::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
-use tray_icon::menu::MenuEvent;
-
 pub(crate) fn build_config_window(
     profile: &str,
     command: &str,
@@ -100,10 +101,10 @@ pub(crate) fn build_config_window(
         "When enabled, command logs are appended to a profile log file.",
     ));
 
-    let apps_toggle = gtk::CheckButton::with_label("Create Applications entry (.desktop)");
+    let apps_toggle = gtk::CheckButton::with_label("Show in Applications menu (.desktop)");
     apps_toggle.set_halign(gtk::Align::Start);
     apps_toggle.set_tooltip_text(Some(
-        "Creates or removes ~/.local/share/applications desktop entry for this profile.",
+        "Controls visibility in app launcher; a hidden identity desktop file is kept for Wayland icon matching.",
     ));
 
     let autostart_desktop_toggle =
@@ -525,14 +526,7 @@ fn refresh_saved_display_state(state: &mut AppState) {
         .logs_window
         .set_title(&logs_window_title(state.display_name.as_deref()));
     let tooltip = tray_tooltip(&state.run_target, state.display_name.as_deref());
-    state.tray_name_item.set_text(&tooltip);
-    if let Some(tray_icon) = state.tray_icon.as_ref() {
-        if let Err(err) = tray_icon.set_tooltip(Some(tooltip.as_str())) {
-            eprintln!("failed to update tray tooltip: {err}");
-        }
-        #[cfg(target_os = "linux")]
-        tray_icon.set_title(Some(tooltip.as_str()));
-    }
+    state.tray.set_display(&tooltip);
 }
 
 fn config_has_unsaved_changes(
@@ -554,7 +548,10 @@ fn config_has_unsaved_changes(
         || current_system_autostart != state.config_saved_system_autostart
 }
 
-pub(crate) fn name_field_has_unsaved_changes(saved_name: &Option<String>, current_name: &str) -> bool {
+pub(crate) fn name_field_has_unsaved_changes(
+    saved_name: &Option<String>,
+    current_name: &str,
+) -> bool {
     match crate::config::parse_optional_display_name(current_name) {
         Ok(current_name) => current_name != *saved_name,
         Err(_) => !current_name.trim().is_empty(),
@@ -594,9 +591,9 @@ pub(crate) fn refresh_desktop_toggles(
 ) {
     let access = state.borrow().persistent_config_access.clone();
     let enabled = access.is_some();
-    let (apps_exists, autostart_exists) = if let Some(access) = access {
+    let (apps_visible, autostart_exists) = if let Some(access) = access {
         (
-            applications_desktop_path(&access.profile).is_some_and(|path| path.exists()),
+            applications_entry_is_visible(&access.profile),
             autostart_desktop_path(&access.profile).is_some_and(|path| path.exists()),
         )
     } else {
@@ -606,11 +603,11 @@ pub(crate) fn refresh_desktop_toggles(
     {
         let mut app = state.borrow_mut();
         app.config_ignore = true;
-        app.config_saved_applications = apps_exists;
+        app.config_saved_applications = apps_visible;
         app.config_saved_system_autostart = autostart_exists;
     }
 
-    apps_toggle.set_active(apps_exists);
+    apps_toggle.set_active(apps_visible);
     system_autostart_toggle.set_active(autostart_exists);
     apps_toggle.set_sensitive(enabled);
     system_autostart_toggle.set_sensitive(enabled);
@@ -625,14 +622,16 @@ pub(crate) fn refresh_desktop_toggles(
 
 pub(crate) fn setup_menu_polling(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>) {
     glib::timeout_add_local(Duration::from_millis(150), move || {
-        while let Ok(event) = MenuEvent::receiver().try_recv() {
-            let id = event.id;
-            if id == "start-stop" {
+        for action in crate::tray::drain_tray_actions() {
+            if action == TrayAction::ToggleStartStop {
                 let (running, can_control) = {
                     let state = state.borrow();
                     (
                         state.child.is_some() || state.owned_pgid.is_some(),
-                        can_control_profile(state.owns_profile_lock),
+                        can_control_profile(
+                            state.persistent_config_access.as_ref(),
+                            state.owns_profile_lock,
+                        ),
                     )
                 };
                 if !can_control {
@@ -647,11 +646,11 @@ pub(crate) fn setup_menu_polling(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiE
                 } else {
                     start_command(state.clone(), ui_tx.clone());
                 }
-            } else if id == "logs" {
+            } else if action == TrayAction::ShowLogs {
                 let window = state.borrow().logs_window.clone();
                 window.show_all();
                 window.resize(820, 520);
-            } else if id == "configure" {
+            } else if action == TrayAction::ShowConfiguration {
                 let can_configure = {
                     let state = state.borrow();
                     should_expose_configuration(state.persistent_config_access.as_ref())
@@ -711,10 +710,10 @@ pub(crate) fn setup_menu_polling(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiE
                 refresh_config_dirty_status(state.clone());
                 window.show_all();
                 view.grab_focus();
-            } else if id == "about" {
+            } else if action == TrayAction::ShowAbout {
                 let window = state.borrow().about_window.clone();
                 window.show_all();
-            } else if id == "exit" {
+            } else if action == TrayAction::Exit {
                 stop_command_blocking(state.clone());
                 gtk::main_quit();
             }

@@ -12,7 +12,13 @@ use crate::config::{
     runtime_state_path_for_ephemeral, runtime_state_path_for_profile, save_config,
     save_runtime_state, validate_saved_command_text,
 };
-use crate::desktop::create_desktop_file_from_cli;
+use crate::desktop::{
+    app_id_for_profile, applications_entry_is_visible, create_desktop_file_from_cli, desktop_entry,
+    desktop_entry_is_visible, desktop_file_name, ensure_hidden_identity_desktop_file,
+    rgba_to_argb_in_place,
+};
+#[cfg(target_os = "linux")]
+use crate::desktop::{resolved_tray_icon_to_sni_pixmap, ResolvedTrayIcon};
 use crate::logs::{
     append_log_to_file, clear_runtime_state_after_exit, extract_log_links, logs_window_title,
     should_activate_log_link, strip_ansi_codes,
@@ -21,6 +27,15 @@ use crate::process::can_control_profile;
 use crate::process::is_process_group_alive;
 use crate::process::reconcile_runtime_state;
 use crate::process::RuntimeReconcileResult;
+#[cfg(target_os = "linux")]
+use crate::tray::{
+    sni_escape_menu_label, sni_id_for_run_target, sni_mode_text, sni_tooltip_description,
+    SNI_MENU_ON_ACTIVATE,
+};
+use crate::tray::{
+    action_from_menu_id, drain_tray_actions, enqueue_tray_action_for_test,
+    tray_menu_overview_label, TrayAction,
+};
 use crate::ui::name_field_has_unsaved_changes;
 use crate::*;
 use std::env;
@@ -245,23 +260,15 @@ fn parse_optional_display_name_treats_blank_as_none() {
 
 #[test]
 fn parse_optional_display_name_trims_non_blank_values() {
-    let parsed =
-        parse_optional_display_name("  Desk Rig  ").expect("display name should parse");
+    let parsed = parse_optional_display_name("  Desk Rig  ").expect("display name should parse");
     assert_eq!(parsed.as_deref(), Some("Desk Rig"));
 }
 
 #[test]
 fn save_configuration_returns_false_for_invalid_command() {
-    let err = build_saved_configuration(
-        "save-test",
-        None,
-        None,
-        "unterminated '",
-        "",
-        false,
-        false,
-    )
-    .expect_err("invalid command should reject save");
+    let err =
+        build_saved_configuration("save-test", None, None, "unterminated '", "", false, false)
+            .expect_err("invalid command should reject save");
 
     assert!(err.contains("invalid command:"));
 }
@@ -293,16 +300,9 @@ fn save_configuration_heals_invalid_saved_names_before_persisting() {
         )
         .expect("baseline config should save");
 
-        let computed = build_saved_configuration(
-            "save-test",
-            None,
-            None,
-            "echo healed",
-            "",
-            false,
-            false,
-        )
-        .expect("save should compute for invalid stored-name healing");
+        let computed =
+            build_saved_configuration("save-test", None, None, "echo healed", "", false, false)
+                .expect("save should compute for invalid stored-name healing");
 
         save_config(&config_path, &computed.config).expect("healed config should save");
 
@@ -696,11 +696,26 @@ fn effective_command_token_supports_sudo_environment_assignment() {
 
 #[test]
 fn ephemeral_tooltip_uses_mode_label() {
-    let tooltip = tray_tooltip(&CliRunTarget::EphemeralArgv {
-        argv: vec!["echo".to_string(), "hello".to_string()],
-    }, None);
+    let tooltip = tray_tooltip(
+        &CliRunTarget::EphemeralArgv {
+            argv: vec!["echo".to_string(), "hello".to_string()],
+        },
+        None,
+    );
 
-    assert_eq!(tooltip, "givetray (ephemeral)");
+    assert_eq!(tooltip, "givetray");
+}
+
+#[test]
+fn tray_menu_overview_label_contains_title_mode_and_status() {
+    assert_eq!(
+        tray_menu_overview_label("givetray", "Ephemeral", false),
+        "givetray\nMode: Ephemeral\nStatus: Stopped"
+    );
+    assert_eq!(
+        tray_menu_overview_label("Office Box", "Persistent", true),
+        "Office Box\nMode: Persistent\nStatus: Running"
+    );
 }
 
 #[test]
@@ -713,6 +728,183 @@ fn tray_tooltip_prefers_display_name_when_set() {
     );
 
     assert_eq!(tooltip, "Office Box");
+}
+
+#[test]
+fn tray_action_mapping_matches_expected_menu_ids() {
+    assert_eq!(
+        action_from_menu_id("start-stop"),
+        Some(TrayAction::ToggleStartStop)
+    );
+    assert_eq!(action_from_menu_id("logs"), Some(TrayAction::ShowLogs));
+    assert_eq!(
+        action_from_menu_id("configure"),
+        Some(TrayAction::ShowConfiguration)
+    );
+    assert_eq!(action_from_menu_id("about"), Some(TrayAction::ShowAbout));
+    assert_eq!(action_from_menu_id("exit"), Some(TrayAction::Exit));
+}
+
+#[test]
+fn tray_action_mapping_ignores_non_action_menu_rows() {
+    assert_eq!(action_from_menu_id("name"), None);
+    assert_eq!(action_from_menu_id("unknown"), None);
+}
+
+#[test]
+fn tray_action_queue_drains_in_send_order() {
+    let _queue_lock = ENV_LOCK.lock().expect("env lock should be acquired");
+    let _ = drain_tray_actions();
+
+    enqueue_tray_action_for_test(TrayAction::ShowLogs);
+    enqueue_tray_action_for_test(TrayAction::ShowAbout);
+    enqueue_tray_action_for_test(TrayAction::Exit);
+
+    let drained = drain_tray_actions();
+    assert_eq!(
+        drained,
+        vec![
+            TrayAction::ShowLogs,
+            TrayAction::ShowAbout,
+            TrayAction::Exit,
+        ]
+    );
+}
+
+#[test]
+fn tray_action_queue_is_empty_after_drain() {
+    let _queue_lock = ENV_LOCK.lock().expect("env lock should be acquired");
+    let _ = drain_tray_actions();
+    enqueue_tray_action_for_test(TrayAction::ShowLogs);
+    let _ = drain_tray_actions();
+
+    assert!(drain_tray_actions().is_empty());
+}
+
+#[test]
+fn rgba_to_argb_conversion_rotates_channels_per_pixel() {
+    let mut rgba = vec![10, 20, 30, 40, 100, 110, 120, 130];
+    rgba_to_argb_in_place(&mut rgba);
+
+    assert_eq!(rgba, vec![40, 10, 20, 30, 130, 100, 110, 120]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn sni_pixmap_uses_argb_from_resolved_icon() {
+    let icon = ResolvedTrayIcon {
+        rgba: vec![1, 2, 3, 4],
+        width: 1,
+        height: 1,
+    };
+
+    let pixmap = resolved_tray_icon_to_sni_pixmap(&icon);
+    assert_eq!(pixmap.len(), 1);
+    assert_eq!(pixmap[0].width, 1);
+    assert_eq!(pixmap[0].height, 1);
+    assert_eq!(pixmap[0].data, vec![4, 1, 2, 3]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn sni_id_is_stable_for_persistent_profile() {
+    let run_target = CliRunTarget::PersistentProfile {
+        profile: "dev profile/1".to_string(),
+    };
+
+    assert_eq!(
+        sni_id_for_run_target(&run_target, true),
+        "givetray.profile.dev_profile_1"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn sni_id_for_secondary_persistent_profile_includes_secondary_pid_suffix() {
+    let run_target = CliRunTarget::PersistentProfile {
+        profile: "dev profile/1".to_string(),
+    };
+
+    let id = sni_id_for_run_target(&run_target, false);
+    let expected_prefix = "givetray.profile.dev_profile_1.secondary.";
+    assert!(id.starts_with(expected_prefix));
+    let pid = id
+        .strip_prefix(expected_prefix)
+        .expect("secondary id should include expected prefix");
+    assert!(pid.parse::<u32>().is_ok());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn sni_id_for_ephemeral_includes_pid_and_sanitized_command() {
+    let run_target = CliRunTarget::EphemeralArgv {
+        argv: vec!["/usr/bin/python3".to_string(), "-m".to_string()],
+    };
+
+    let id = sni_id_for_run_target(&run_target, false);
+    assert!(id.starts_with("givetray.ephemeral."));
+    assert!(id.ends_with(".python3"));
+
+    let parts: Vec<&str> = id.split('.').collect();
+    assert_eq!(parts.len(), 5);
+    assert_eq!(parts[0], "givetray");
+    assert_eq!(parts[1], "ephemeral");
+    assert!(parts[2].parse::<u32>().is_ok());
+    assert!(parts[3].parse::<u128>().is_ok());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn sni_id_for_ephemeral_falls_back_to_cmd_token() {
+    let run_target = CliRunTarget::EphemeralArgv { argv: Vec::new() };
+
+    let id = sni_id_for_run_target(&run_target, false);
+    assert!(id.ends_with(".cmd"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn sni_mode_text_distinguishes_persistent_vs_ephemeral() {
+    assert_eq!(
+        sni_mode_text(&CliRunTarget::PersistentProfile {
+            profile: "default".to_string(),
+        }),
+        "Persistent"
+    );
+    assert_eq!(
+        sni_mode_text(&CliRunTarget::EphemeralArgv {
+            argv: vec!["echo".to_string()],
+        }),
+        "Ephemeral"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn sni_tooltip_description_includes_mode_and_status() {
+    assert_eq!(
+        sni_tooltip_description("Ephemeral", true),
+        "Mode: Ephemeral\nStatus: Running"
+    );
+    assert_eq!(
+        sni_tooltip_description("Persistent", false),
+        "Mode: Persistent\nStatus: Stopped"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn sni_menu_label_escapes_underscores() {
+    assert_eq!(
+        sni_escape_menu_label("name_with_underscores"),
+        "name__with__underscores"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn sni_left_click_opens_menu() {
+    assert!(SNI_MENU_ON_ACTIVATE);
 }
 
 #[test]
@@ -990,6 +1182,31 @@ fn startup_preflight_runs_after_detach_for_persistent_profiles() {
 }
 
 #[test]
+fn startup_identity_order_keeps_prgname_before_gtk_init_and_program_class_after() {
+    let main_rs_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
+    let main_rs = fs::read_to_string(&main_rs_path).expect("main.rs should be readable");
+
+    let prgname_idx = main_rs
+        .find("gtk::glib::set_prgname(Some(&app_id));")
+        .expect("main should set prgname for persistent profiles");
+    let init_idx = main_rs
+        .find("gtk::init().expect(\"failed to initialize GTK\");")
+        .expect("main should initialize GTK");
+    let program_class_idx = main_rs
+        .rfind("gtk::gdk::set_program_class(&app_id);")
+        .expect("main should set program class");
+
+    assert!(
+        prgname_idx < init_idx,
+        "set_prgname must remain before gtk::init"
+    );
+    assert!(
+        init_idx < program_class_idx,
+        "set_program_class must run only after gtk::init"
+    );
+}
+
+#[test]
 fn startup_state_display_name_prefers_cli_override() {
     let _env_lock = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
     let temp_root = unique_test_dir("startup-display-name-cli-override");
@@ -1055,7 +1272,8 @@ fn startup_state_ignores_invalid_config_display_names() {
         ("   \t", "whitespace-only"),
         ("Desk\nRig", "control-character"),
     ] {
-        let temp_root = unique_test_dir(&format!("startup-display-name-config-invalid-{case_name}"));
+        let temp_root =
+            unique_test_dir(&format!("startup-display-name-config-invalid-{case_name}"));
         fs::create_dir_all(&temp_root).expect("temp root should be created");
         let _env = TestEnvGuard::set(&temp_root);
 
@@ -1076,8 +1294,14 @@ fn startup_state_ignores_invalid_config_display_names() {
         let cli = parse_cli_args_from(["givetray", "-c", "default"]).expect("cli should parse");
         let startup = build_startup_state(&cli).expect("startup should build");
 
-        assert_eq!(startup.display_name, None, "case should be sanitized: {case_name}");
-        assert_eq!(tray_tooltip(&cli.run_target, startup.display_name.as_deref()), "givetray (default)");
+        assert_eq!(
+            startup.display_name, None,
+            "case should be sanitized: {case_name}"
+        );
+        assert_eq!(
+            tray_tooltip(&cli.run_target, startup.display_name.as_deref()),
+            "givetray (default)"
+        );
         assert_eq!(logs_window_title(startup.display_name.as_deref()), "Logs");
     }
 }
@@ -1126,6 +1350,44 @@ fn startup_preflight_does_not_persist_cli_overrides_without_profile_lock() {
 }
 
 #[test]
+fn non_owner_startup_skips_hidden_identity_desktop_file_mutation() {
+    let _env_lock = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let temp_root = unique_test_dir("non-owner-skip-identity-desktop");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let profile = "default";
+    let config = Config {
+        command: "echo ready".to_string(),
+        autostart: false,
+        name: None,
+        icon_path: None,
+        log_to_file: false,
+        log_file_path: None,
+    };
+
+    let path = crate::desktop::applications_desktop_path(profile)
+        .expect("applications desktop path should resolve");
+    assert!(!path.exists());
+
+    let skipped = ensure_profile_identity_desktop_if_owner(profile, &config, false);
+    assert!(skipped.is_none());
+    assert!(!path.exists());
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("applications dir should exist");
+    }
+    let sentinel = "[Desktop Entry]\nName=sentinel\nNoDisplay=true\n";
+    atomic_write(&path, sentinel).expect("sentinel desktop entry should write");
+
+    let skipped = ensure_profile_identity_desktop_if_owner(profile, &config, false);
+    assert!(skipped.is_none());
+    let contents =
+        fs::read_to_string(&path).expect("sentinel desktop entry should remain readable");
+    assert_eq!(contents, sentinel);
+}
+
+#[test]
 fn desktop_file_creation_requires_profile_lock_before_persisting_overrides() {
     let _env_lock = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
     let temp_root = unique_test_dir("desktop-file-lock-guard");
@@ -1169,6 +1431,175 @@ fn desktop_file_creation_requires_profile_lock_before_persisting_overrides() {
     let saved = fs::read_to_string(&config_path).expect("config should remain readable");
     assert!(saved.contains("echo baseline"));
     assert!(!saved.contains("printf changed"));
+}
+
+#[test]
+fn app_id_matches_desktop_filename_stem() {
+    let profile = "default";
+    let app_id = app_id_for_profile(profile);
+    let desktop_name = desktop_file_name(profile);
+
+    assert_eq!(app_id, "givetray_default");
+    assert_eq!(desktop_name, "givetray_default.desktop");
+    assert_eq!(desktop_name.trim_end_matches(".desktop"), app_id);
+}
+
+#[test]
+fn app_id_sanitizes_profile_for_desktop_identity() {
+    let app_id = app_id_for_profile("dev profile/1");
+
+    assert_eq!(app_id, "givetray_dev_profile_1");
+}
+
+#[test]
+fn desktop_entry_includes_startup_wm_class() {
+    let entry = desktop_entry(
+        Path::new("/usr/bin/givetray"),
+        Path::new("/tmp/icon.png"),
+        "default",
+        false,
+        false,
+    );
+
+    assert!(entry.contains("StartupWMClass=givetray_default\n"));
+    assert!(!entry.contains("NoDisplay=true\n"));
+}
+
+#[test]
+fn hidden_identity_desktop_entry_sets_no_display() {
+    let entry = desktop_entry(
+        Path::new("/usr/bin/givetray"),
+        Path::new("/tmp/icon.png"),
+        "default",
+        false,
+        true,
+    );
+
+    assert!(entry.contains("StartupWMClass=givetray_default\n"));
+    assert!(entry.contains("NoDisplay=true\n"));
+}
+
+#[test]
+fn desktop_entry_is_visible_detects_hidden_marker() {
+    let visible_entry = desktop_entry(
+        Path::new("/usr/bin/givetray"),
+        Path::new("/tmp/icon.png"),
+        "default",
+        false,
+        false,
+    );
+    let hidden_entry = desktop_entry(
+        Path::new("/usr/bin/givetray"),
+        Path::new("/tmp/icon.png"),
+        "default",
+        false,
+        true,
+    );
+
+    assert!(desktop_entry_is_visible(&visible_entry));
+    assert!(!desktop_entry_is_visible(&hidden_entry));
+}
+
+#[test]
+fn applications_entry_visibility_reads_no_display_from_file() {
+    let _env_lock = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let temp_root = unique_test_dir("applications-entry-visibility");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let profile = "default";
+    let path = crate::desktop::applications_desktop_path(profile)
+        .expect("applications desktop path should resolve");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("applications dir should exist");
+    }
+
+    let visible_entry = desktop_entry(
+        Path::new("/usr/bin/givetray"),
+        Path::new("/tmp/icon.png"),
+        profile,
+        false,
+        false,
+    );
+    atomic_write(&path, &visible_entry).expect("visible desktop entry should write");
+    assert!(applications_entry_is_visible(profile));
+
+    let hidden_entry = desktop_entry(
+        Path::new("/usr/bin/givetray"),
+        Path::new("/tmp/icon.png"),
+        profile,
+        false,
+        true,
+    );
+    atomic_write(&path, &hidden_entry).expect("hidden desktop entry should write");
+    assert!(!applications_entry_is_visible(profile));
+}
+
+#[test]
+fn ensure_hidden_identity_desktop_file_writes_hidden_app_identity() {
+    let _env_lock = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let temp_root = unique_test_dir("hidden-identity-desktop-file");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let config = Config {
+        command: "echo ready".to_string(),
+        autostart: false,
+        name: None,
+        icon_path: None,
+        log_to_file: false,
+        log_file_path: None,
+    };
+
+    let path = ensure_hidden_identity_desktop_file("default", &config)
+        .expect("hidden identity desktop file should be created");
+    let contents =
+        fs::read_to_string(&path).expect("hidden identity desktop file should be readable");
+
+    assert!(path.ends_with("givetray_default.desktop"));
+    assert!(contents.contains("StartupWMClass=givetray_default\n"));
+    assert!(contents.contains("NoDisplay=true\n"));
+}
+
+#[test]
+fn ensure_hidden_identity_desktop_file_preserves_visible_entry_visibility() {
+    let _env_lock = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let temp_root = unique_test_dir("hidden-identity-desktop-file-preserve-visible");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let profile = "default";
+    let config = Config {
+        command: "echo ready".to_string(),
+        autostart: false,
+        name: None,
+        icon_path: None,
+        log_to_file: false,
+        log_file_path: None,
+    };
+
+    let path = crate::desktop::applications_desktop_path(profile)
+        .expect("applications desktop path should resolve");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("applications dir should exist");
+    }
+
+    let visible_entry = desktop_entry(
+        Path::new("/usr/bin/givetray"),
+        Path::new("/tmp/icon.png"),
+        profile,
+        false,
+        false,
+    );
+    atomic_write(&path, &visible_entry).expect("visible desktop entry should write");
+
+    ensure_hidden_identity_desktop_file(profile, &config)
+        .expect("ensure hidden identity should keep visible entry visible");
+
+    let updated = fs::read_to_string(&path).expect("desktop entry should remain readable");
+    assert!(updated.contains("StartupWMClass=givetray_default\n"));
+    assert!(desktop_entry_is_visible(&updated));
+    assert!(!updated.contains("NoDisplay=true\n"));
 }
 
 #[test]
@@ -1461,13 +1892,54 @@ fn dropping_profile_lock_releases_for_reacquisition() {
 }
 
 #[test]
-fn non_owning_profile_session_cannot_start_command() {
-    assert!(!can_control_profile(false));
+fn ephemeral_session_can_control_start_stop_without_profile_lock() {
+    assert!(can_control_profile(None, false));
 }
 
 #[test]
-fn non_owning_profile_session_cannot_save_configuration() {
-    assert!(!can_save_profile_configuration(false));
+fn owning_persistent_profile_session_can_control_start_stop() {
+    let access = PersistentConfigAccess {
+        profile: "default".to_string(),
+        config_path: PathBuf::from("/tmp/default.toml"),
+    };
+
+    assert!(can_control_profile(Some(&access), true));
+}
+
+#[test]
+fn non_owning_persistent_profile_session_cannot_control_start_stop() {
+    let access = PersistentConfigAccess {
+        profile: "default".to_string(),
+        config_path: PathBuf::from("/tmp/default.toml"),
+    };
+
+    assert!(!can_control_profile(Some(&access), false));
+}
+
+#[test]
+fn configuration_save_is_unavailable_in_ephemeral_mode() {
+    assert!(!can_save_profile_configuration(None, false));
+    assert!(!can_save_profile_configuration(None, true));
+}
+
+#[test]
+fn owning_persistent_profile_session_can_save_configuration() {
+    let access = PersistentConfigAccess {
+        profile: "default".to_string(),
+        config_path: PathBuf::from("/tmp/default.toml"),
+    };
+
+    assert!(can_save_profile_configuration(Some(&access), true));
+}
+
+#[test]
+fn non_owning_persistent_profile_session_cannot_save_configuration() {
+    let access = PersistentConfigAccess {
+        profile: "default".to_string(),
+        config_path: PathBuf::from("/tmp/default.toml"),
+    };
+
+    assert!(!can_save_profile_configuration(Some(&access), false));
 }
 
 #[test]
@@ -2058,12 +2530,6 @@ fn clear_runtime_state_after_exit_removes_persisted_file() {
     clear_runtime_state_after_exit(Some(&state_path));
 
     assert!(!state_path.exists());
-}
-
-#[test]
-fn initial_start_stop_label_reflects_restored_state() {
-    assert_eq!(initial_start_stop_label(false), "Start");
-    assert_eq!(initial_start_stop_label(true), "Stop");
 }
 
 #[test]

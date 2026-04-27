@@ -277,7 +277,14 @@ pub fn persist_launch_metadata_with_start_time(
     save_runtime_state(runtime_state_path, &state)
 }
 
-pub(crate) fn can_control_profile(owns_profile_lock: bool) -> bool {
+pub(crate) fn can_control_profile(
+    persistent_config_access: Option<&crate::PersistentConfigAccess>,
+    owns_profile_lock: bool,
+) -> bool {
+    if persistent_config_access.is_none() {
+        return true;
+    }
+
     owns_profile_lock
 }
 
@@ -305,7 +312,10 @@ fn flush_dropped_lines_blocking(ui_tx: &Sender<UiEvent>, dropped_lines: &mut usi
 }
 
 pub(crate) fn start_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>) {
-    if !can_control_profile(state.borrow().owns_profile_lock) {
+    if !can_control_profile(
+        state.borrow().persistent_config_access.as_ref(),
+        state.borrow().owns_profile_lock,
+    ) {
         let _ = try_send_main_thread_event(
             &ui_tx,
             UiEvent::AppendLog(profile_lock_action_blocked_message()),
@@ -430,13 +440,16 @@ pub(crate) fn start_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>
     state.borrow_mut().process_exit_reported = false;
 
     if !try_send_main_thread_event(&ui_tx, UiEvent::SetRunning(true)) {
-        state.borrow().start_stop_item.set_text("Stop");
+        state.borrow().tray.set_running(true);
     }
     let _ = try_send_main_thread_event(&ui_tx, UiEvent::AppendLog("command started".to_string()));
 }
 
 pub(crate) fn stop_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>) {
-    if !can_control_profile(state.borrow().owns_profile_lock) {
+    if !can_control_profile(
+        state.borrow().persistent_config_access.as_ref(),
+        state.borrow().owns_profile_lock,
+    ) {
         let _ = try_send_main_thread_event(
             &ui_tx,
             UiEvent::AppendLog(profile_lock_action_blocked_message()),
@@ -681,7 +694,7 @@ pub(crate) fn ensure_sudo_stdin_flag(args: &mut Vec<String>) {
 
 fn prompt_sudo_password() -> Option<Zeroizing<String>> {
     let dialog = gtk::Dialog::with_buttons(
-        Some("Sudo Password"),
+        Some("Enter Password"),
         None::<&gtk::Window>,
         gtk::DialogFlags::MODAL,
         &[

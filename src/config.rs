@@ -251,7 +251,10 @@ pub(crate) fn save_configuration(
     log_to_file_enabled: bool,
 ) -> bool {
     let mut state = state.borrow_mut();
-    if !can_save_profile_configuration(state.owns_profile_lock) {
+    if !can_save_profile_configuration(
+        state.persistent_config_access.as_ref(),
+        state.owns_profile_lock,
+    ) {
         append_log(&mut state, profile_lock_action_blocked_message());
         return false;
     }
@@ -341,7 +344,8 @@ pub(crate) fn build_saved_configuration(
 
     let mut log_file_path = saved_log_file_path;
     if log_to_file_enabled && log_file_path.is_none() {
-        log_file_path = default_log_file_path(profile).map(|path| path.to_string_lossy().to_string());
+        log_file_path =
+            default_log_file_path(profile).map(|path| path.to_string_lossy().to_string());
     }
 
     Ok(SavedConfiguration {
@@ -404,7 +408,14 @@ pub(crate) fn validate_display_name_override(raw: &str) -> Result<String, String
     }
 }
 
-pub(crate) fn can_save_profile_configuration(owns_profile_lock: bool) -> bool {
+pub(crate) fn can_save_profile_configuration(
+    persistent_config_access: Option<&crate::PersistentConfigAccess>,
+    owns_profile_lock: bool,
+) -> bool {
+    if persistent_config_access.is_none() {
+        return false;
+    }
+
     owns_profile_lock
 }
 

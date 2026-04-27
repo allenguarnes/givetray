@@ -5,16 +5,23 @@ mod logs;
 mod process;
 #[cfg(test)]
 mod tests;
+mod tray;
 mod ui;
 
 use crate::cli::{
     parse_cli_args, prepare_run_startup, should_expose_configuration, tray_tooltip,
     validate_runtime_mode,
 };
-use crate::config::{normalize_saved_display_name, reconcile_startup_runtime_state, ProfileLockHandle};
-use crate::desktop::{create_desktop_file_from_cli, load_tray_icon, load_window_icon_pixbuf};
+use crate::config::{
+    normalize_saved_display_name, reconcile_startup_runtime_state, ProfileLockHandle,
+};
+use crate::desktop::{
+    app_id_for_profile, create_desktop_file_from_cli, ensure_hidden_identity_desktop_file,
+    load_window_icon_pixbuf, resolve_tray_icon,
+};
 use crate::logs::{build_logs_window, setup_log_receiver, setup_logs_handlers};
 use crate::process::start_command;
+use crate::tray::TrayHandle;
 use crate::ui::{
     build_about_window, build_config_window, install_css, install_log_filters,
     refresh_desktop_toggles, setup_config_handlers, setup_menu_polling, setup_process_watcher,
@@ -58,9 +65,6 @@ impl RuntimeOwnershipState {
         Ok(())
     }
 }
-use tray_icon::menu::{Menu, MenuId, MenuItem, PredefinedMenuItem};
-use tray_icon::TrayIconBuilder;
-
 const APP_NAME: &str = "givetray";
 const DEFAULT_PROFILE: &str = "default";
 const DEFAULT_COMMAND: &str = "echo configure command";
@@ -152,7 +156,7 @@ enum UiEvent {
 
 struct AppState {
     run_target: CliRunTarget,
-    tray_icon: Option<tray_icon::TrayIcon>,
+    tray: TrayHandle,
     persistent_config_access: Option<PersistentConfigAccess>,
     display_name: Option<String>,
     command: String,
@@ -200,8 +204,6 @@ struct AppState {
     config_redo: Vec<String>,
     config_last: String,
     config_ignore: bool,
-    tray_name_item: MenuItem,
-    start_stop_item: MenuItem,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,16 +247,20 @@ enum ConfigCloseAction {
     Cancel,
 }
 
-fn initial_start_stop_label(restored_running: bool) -> &'static str {
-    if restored_running {
-        "Stop"
-    } else {
-        "Start"
-    }
-}
-
 fn should_launch_on_startup(startup: &StartupState) -> bool {
     startup.launch_on_startup && !startup.restored_running
+}
+
+pub(crate) fn ensure_profile_identity_desktop_if_owner(
+    profile: &str,
+    config: &Config,
+    owns_profile_lock: bool,
+) -> Option<Result<PathBuf, String>> {
+    if !owns_profile_lock {
+        return None;
+    }
+
+    Some(ensure_hidden_identity_desktop_file(profile, config))
 }
 
 fn main() {
@@ -297,7 +303,26 @@ fn main() {
 
     let startup = reconcile_startup_runtime_state(startup);
 
+    if let Some(profile) = cli.persistent_profile() {
+        if let Some(Err(err)) =
+            ensure_profile_identity_desktop_if_owner(profile, &startup.config, startup.owns_profile_lock)
+        {
+            eprintln!("warning: failed to ensure hidden desktop identity for {profile}: {err}");
+        }
+
+        let app_id = app_id_for_profile(profile);
+        gtk::glib::set_prgname(Some(&app_id));
+    }
+
+    gtk::glib::set_application_name(APP_NAME);
+
     gtk::init().expect("failed to initialize GTK");
+
+    if let Some(profile) = cli.persistent_profile() {
+        let app_id = app_id_for_profile(profile);
+        gtk::gdk::set_program_class(&app_id);
+    }
+
     install_css();
 
     let window_icon = load_window_icon_pixbuf(&startup.config);
@@ -347,61 +372,26 @@ fn main() {
     let (ui_tx, ui_rx) = async_channel::bounded::<UiEvent>(UI_EVENT_CHANNEL_CAPACITY);
 
     let tooltip = tray_tooltip(&cli.run_target, startup.display_name.as_deref());
-
-    let name_id = MenuId::new("name");
-    let start_stop_id = MenuId::new("start-stop");
-    let logs_id = MenuId::new("logs");
-    let configure_id = MenuId::new("configure");
-    let about_id = MenuId::new("about");
-    let exit_id = MenuId::new("exit");
-
-    let name_item = MenuItem::with_id(name_id.clone(), &tooltip, false, None);
-    let start_stop_item = MenuItem::with_id(
-        start_stop_id.clone(),
-        initial_start_stop_label(startup.restored_running),
-        true,
-        None,
-    );
-    let logs_item = MenuItem::with_id(logs_id.clone(), "Logs", true, None);
-    let configure_item = MenuItem::with_id(configure_id.clone(), "Configuration", true, None);
-    let about_item = MenuItem::with_id(about_id.clone(), "About", true, None);
-    let exit_item = MenuItem::with_id(exit_id.clone(), "Exit", true, None);
-
-    let tray_menu = Menu::new();
-    tray_menu.append(&name_item).expect("menu append failed");
-    tray_menu
-        .append(&start_stop_item)
-        .expect("menu append failed");
-    tray_menu.append(&logs_item).expect("menu append failed");
-    if should_expose_configuration(startup.persistent_config_access.as_ref()) {
-        tray_menu
-            .append(&configure_item)
-            .expect("menu append failed");
-    }
-    tray_menu.append(&about_item).expect("menu append failed");
-    tray_menu
-        .append(&PredefinedMenuItem::separator())
-        .expect("menu append failed");
-    tray_menu.append(&exit_item).expect("menu append failed");
-
-    let tray_icon = load_tray_icon(&startup.config).expect("failed to load tray icon");
+    let resolved_tray_icon = resolve_tray_icon(&startup.config).expect("failed to load tray icon");
+    let tray_icon = resolved_tray_icon
+        .to_tray_icon()
+        .expect("failed to build tray icon");
+    let tray = crate::tray::build_tray(
+        &tooltip,
+        should_expose_configuration(startup.persistent_config_access.as_ref()),
+        startup.restored_running,
+        &cli.run_target,
+        startup.owns_profile_lock,
+        tray_icon,
+        Some(&resolved_tray_icon),
+    )
+    .expect("failed to create tray icon");
     let should_launch = should_launch_on_startup(&startup);
     let startup_message = startup.startup_message.clone();
-    let mut tray_icon_builder = TrayIconBuilder::new()
-        .with_menu(Box::new(tray_menu))
-        .with_tooltip(&tooltip)
-        .with_icon(tray_icon);
-    #[cfg(target_os = "linux")]
-    {
-        tray_icon_builder = tray_icon_builder.with_title(&tooltip);
-    }
-    let tray_icon = tray_icon_builder
-        .build()
-        .expect("failed to create tray icon");
 
     let state = Rc::new(RefCell::new(AppState {
         run_target: cli.run_target.clone(),
-        tray_icon: Some(tray_icon),
+        tray,
         persistent_config_access: startup.persistent_config_access,
         display_name: startup.display_name.clone(),
         command: startup.config.command.clone(),
@@ -449,8 +439,6 @@ fn main() {
         config_redo: Vec::new(),
         config_last: startup.config.command,
         config_ignore: false,
-        tray_name_item: name_item,
-        start_stop_item,
     }));
 
     {

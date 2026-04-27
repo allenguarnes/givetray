@@ -3,8 +3,7 @@ use crate::config::{
     config_path_for_profile, load_or_create_config, load_runtime_state_result,
     profile_lock_path_for_profile, resolve_log_file_path, runtime_state_path_for_ephemeral,
     runtime_state_path_for_profile, save_config, validate_display_name_override,
-    validate_saved_command_text,
-    RuntimeStateLoadResult,
+    validate_saved_command_text, RuntimeStateLoadResult,
 };
 use crate::{
     CliMode, CliOptions, CliRequest, CliRunTarget, Config, PersistentConfigAccess, StartupState,
@@ -115,6 +114,9 @@ pub(crate) fn build_detached_args(cli: &CliOptions) -> Vec<String> {
 pub(crate) fn tray_tooltip(run_target: &CliRunTarget, display_name: Option<&str>) -> String {
     if let Some(display_name) = display_name {
         return display_name.to_string();
+    }
+    if matches!(run_target, CliRunTarget::EphemeralArgv { .. }) {
+        return APP_NAME.to_string();
     }
     format!("{APP_NAME} ({})", run_target_label(run_target))
 }
@@ -537,8 +539,7 @@ where
 
         if matches!(
             arg.as_str(),
-            "-c"
-                | "--config"
+            "-c" | "--config"
                 | "-cmd"
                 | "--command"
                 | "-n"
@@ -830,7 +831,10 @@ fn normalize_display_name(raw: &str) -> Option<String> {
     crate::config::normalize_display_name(raw)
 }
 
-fn resolve_display_name(cli_name_override: Option<&str>, config_name: Option<&str>) -> Option<String> {
+fn resolve_display_name(
+    cli_name_override: Option<&str>,
+    config_name: Option<&str>,
+) -> Option<String> {
     cli_name_override
         .and_then(normalize_display_name)
         .or_else(|| config_name.and_then(normalize_display_name))

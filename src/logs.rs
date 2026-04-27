@@ -1,8 +1,8 @@
+use crate::process::{start_command, stop_command};
 use crate::{
     config::clear_runtime_state, AppState, LogLink, PendingLogLink, UiEvent, LOG_LINK_CLICK_SLOP,
     LOG_LINK_TAG_NAME, MAX_LOG_LINES,
 };
-use crate::process::{start_command, stop_command};
 use async_channel::{Receiver, Sender};
 use glib::{ControlFlow, MainContext, Propagation};
 use std::time::Duration;
@@ -31,7 +31,9 @@ pub(crate) fn clear_runtime_state_after_exit(runtime_state_path: Option<&Path>) 
     }
 }
 
-pub(crate) fn build_logs_window(display_name: Option<&str>) -> (
+pub(crate) fn build_logs_window(
+    display_name: Option<&str>,
+) -> (
     gtk::Window,
     gtk::TextView,
     gtk::TextBuffer,
@@ -87,7 +89,8 @@ pub(crate) fn build_logs_window(display_name: Option<&str>) -> (
     copy_button.add(&copy_box);
 
     let start_button = gtk::Button::new();
-    let start_icon = gtk::Image::from_icon_name(Some("media-playback-start"), gtk::IconSize::Button);
+    let start_icon =
+        gtk::Image::from_icon_name(Some("media-playback-start"), gtk::IconSize::Button);
     let start_label = gtk::Label::new(Some("Start"));
     let start_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     start_box.pack_start(&start_icon, false, false, 0);
@@ -235,25 +238,28 @@ pub(crate) fn setup_logs_handlers(state: Rc<RefCell<AppState>>, ui_tx: Sender<Ui
             let ui_tx_restart_delayed = ui_tx_restart.clone();
             let mut attempts = 0;
 
-            glib::timeout_add_local(Duration::from_millis(RESTART_CHECK_INTERVAL_MS), move || {
-                attempts += 1;
-                let running = {
-                    let state = state_restart_delayed.borrow();
-                    state.child.is_some() || state.owned_pgid.is_some()
-                };
-                if !running {
-                    start_command(state_restart_delayed.clone(), ui_tx_restart_delayed.clone());
-                    set_logs_button_states(&state_restart_delayed.borrow());
-                    ControlFlow::Break
-                } else if attempts >= MAX_RESTART_ATTEMPTS {
-                    let _ = ui_tx_restart_delayed.try_send(UiEvent::AppendLog(
-                        "restart failed: command did not stop in time".to_string()
-                    ));
-                    ControlFlow::Break
-                } else {
-                    ControlFlow::Continue
-                }
-            });
+            glib::timeout_add_local(
+                Duration::from_millis(RESTART_CHECK_INTERVAL_MS),
+                move || {
+                    attempts += 1;
+                    let running = {
+                        let state = state_restart_delayed.borrow();
+                        state.child.is_some() || state.owned_pgid.is_some()
+                    };
+                    if !running {
+                        start_command(state_restart_delayed.clone(), ui_tx_restart_delayed.clone());
+                        set_logs_button_states(&state_restart_delayed.borrow());
+                        ControlFlow::Break
+                    } else if attempts >= MAX_RESTART_ATTEMPTS {
+                        let _ = ui_tx_restart_delayed.try_send(UiEvent::AppendLog(
+                            "restart failed: command did not stop in time".to_string(),
+                        ));
+                        ControlFlow::Break
+                    } else {
+                        ControlFlow::Continue
+                    }
+                },
+            );
         } else {
             start_command(state_restart.clone(), ui_tx_restart.clone());
             set_logs_button_states(&state_restart.borrow());
@@ -380,7 +386,7 @@ pub(crate) fn apply_process_exited(state: &mut AppState, code: Option<i32>) {
     if owned_was_cleared {
         clear_runtime_state_after_exit(state.runtime_state_path.as_deref());
         state.restored_running = false;
-        state.start_stop_item.set_text("Start");
+        state.tray.set_running(false);
     }
 
     state.child = None;
@@ -423,9 +429,7 @@ pub(crate) fn setup_log_receiver(state: Rc<RefCell<AppState>>, receiver: Receive
                 UiEvent::ProcessExited(code) => apply_process_exited(&mut state, code),
                 UiEvent::SetRunning(running) => {
                     set_logs_button_states(&state);
-                    state
-                        .start_stop_item
-                        .set_text(if running { "Stop" } else { "Start" });
+                    state.tray.set_running(running);
                 }
                 UiEvent::ClearRuntimeState => apply_clear_runtime_state(&mut state),
             }

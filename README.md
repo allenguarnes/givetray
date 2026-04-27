@@ -101,7 +101,9 @@ To make changes, close the first instance or use a different profile name.
 - Autostart location: `~/.config/autostart`
 - `desktop-file` writes to Applications by default
 - `--autostart` switches default target to autostart
-- Configuration toggles can create/remove entries in both locations
+- Applications toggle controls launcher visibility (`NoDisplay=true` when hidden)
+- A hidden identity desktop file is kept for Wayland icon/window matching
+- Session autostart toggle still creates/removes `~/.config/autostart` entry
 
 ## GUI Features
 
@@ -136,7 +138,7 @@ To make changes, close the first instance or use a different profile name.
 - Command/script editor for the active profile
 - Run command on launch toggle
 - Write logs to file toggle
-- Applications entry toggle
+- Applications visibility toggle
 - Session autostart toggle
 - Saved/unsaved status with close confirmation
 

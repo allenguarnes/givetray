@@ -6,6 +6,7 @@ use crate::logs::append_log;
 use crate::{AppState, CliOptions, Config, APP_NAME, BUNDLED_ICON_FILE_NAME, ICON_FILE_NAME};
 use directories::{BaseDirs, ProjectDirs};
 use gtk::gdk_pixbuf::Pixbuf;
+use image::RgbaImage;
 use std::cell::RefCell;
 use std::env;
 use std::fs;
@@ -51,7 +52,7 @@ pub(crate) fn create_desktop_file_from_cli(
             .ok_or_else(|| "unable to resolve Applications desktop path".to_string())?
     };
 
-    let contents = desktop_entry(&exec_path, &icon_path, profile, autostart);
+    let contents = desktop_entry(&exec_path, &icon_path, profile, autostart, false);
     write_desktop_file(&desktop_path, &contents)
         .map_err(|err| format!("failed to write desktop file: {err}"))?;
 
@@ -108,28 +109,30 @@ pub(crate) fn apply_desktop_actions(
 
     if let Some(path) = applications_desktop_path(&access.profile) {
         if apps_enabled {
-            let content = desktop_entry(&exec_path, &icon_path, &access.profile, false);
+            let content = desktop_entry(&exec_path, &icon_path, &access.profile, false, false);
             if let Err(err) = write_desktop_file(&path, &content) {
                 append_log(
                     &mut state.borrow_mut(),
-                    format!("Failed to add Applications entry: {err}"),
+                    format!("Failed to set Applications entry visible: {err}"),
                 );
             } else {
                 append_log(
                     &mut state.borrow_mut(),
-                    format!("Applications entry updated: {desktop_name}"),
+                    format!("Applications entry visible: {desktop_name}"),
                 );
             }
-        } else if path.exists() {
-            match fs::remove_file(&path) {
-                Ok(_) => append_log(
+        } else {
+            let content = desktop_entry(&exec_path, &icon_path, &access.profile, false, true);
+            if let Err(err) = write_desktop_file(&path, &content) {
+                append_log(
                     &mut state.borrow_mut(),
-                    format!("Applications entry removed: {desktop_name}"),
-                ),
-                Err(err) => append_log(
+                    format!("Failed to hide Applications entry: {err}"),
+                );
+            } else {
+                append_log(
                     &mut state.borrow_mut(),
-                    format!("Failed to remove Applications entry: {err}"),
-                ),
+                    format!("Applications entry hidden: {desktop_name}"),
+                );
             }
         }
     } else {
@@ -141,7 +144,7 @@ pub(crate) fn apply_desktop_actions(
 
     if let Some(path) = autostart_desktop_path(&access.profile) {
         if autostart_enabled {
-            let content = desktop_entry(&exec_path, &icon_path, &access.profile, true);
+            let content = desktop_entry(&exec_path, &icon_path, &access.profile, true, false);
             if let Err(err) = write_desktop_file(&path, &content) {
                 append_log(
                     &mut state.borrow_mut(),
@@ -185,7 +188,7 @@ pub(crate) fn applications_desktop_path(profile: &str) -> Option<PathBuf> {
     BaseDirs::new().map(|dirs| {
         dirs.data_local_dir()
             .join("applications")
-            .join(desktop_file_name(profile))
+            .join(format!("{}.desktop", app_id_for_profile(profile)))
     })
 }
 
@@ -195,6 +198,20 @@ pub(crate) fn autostart_desktop_path(profile: &str) -> Option<PathBuf> {
             .join("autostart")
             .join(desktop_file_name(profile))
     })
+}
+
+pub(crate) fn applications_entry_is_visible(profile: &str) -> bool {
+    let Some(path) = applications_desktop_path(profile) else {
+        return false;
+    };
+    if !path.exists() {
+        return false;
+    }
+
+    match fs::read_to_string(&path) {
+        Ok(contents) => desktop_entry_is_visible(&contents),
+        Err(_) => true,
+    }
 }
 
 pub(crate) fn profile_icon_path(profile: &str) -> Option<PathBuf> {
@@ -249,7 +266,31 @@ pub(crate) fn load_window_icon_pixbuf(config: &Config) -> Option<Pixbuf> {
     Pixbuf::from_file(icon_path).ok()
 }
 
-pub(crate) fn load_tray_icon(config: &Config) -> Result<Icon, Box<dyn std::error::Error>> {
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedTrayIcon {
+    pub(crate) rgba: Vec<u8>,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
+impl ResolvedTrayIcon {
+    pub(crate) fn to_tray_icon(&self) -> Result<Icon, tray_icon::BadIcon> {
+        Icon::from_rgba(self.rgba.clone(), self.width, self.height)
+    }
+}
+
+fn resolved_tray_icon_from_image(image: RgbaImage) -> ResolvedTrayIcon {
+    let (width, height) = image.dimensions();
+    ResolvedTrayIcon {
+        rgba: image.into_raw(),
+        width,
+        height,
+    }
+}
+
+pub(crate) fn resolve_tray_icon(
+    config: &Config,
+) -> Result<ResolvedTrayIcon, Box<dyn std::error::Error>> {
     if let Some(path) = config.icon_path.as_ref() {
         let icon_path = PathBuf::from(path);
         if icon_path.exists() {
@@ -257,11 +298,7 @@ pub(crate) fn load_tray_icon(config: &Config) -> Result<Icon, Box<dyn std::error
                 .map_err(|err| err.to_string())
                 .and_then(|bytes| image::load_from_memory(&bytes).map_err(|err| err.to_string()))
             {
-                Ok(image) => {
-                    let rgba = image.to_rgba8();
-                    let (width, height) = rgba.dimensions();
-                    return Ok(Icon::from_rgba(rgba.into_raw(), width, height)?);
-                }
+                Ok(image) => return Ok(resolved_tray_icon_from_image(image.to_rgba8())),
                 Err(err) => eprintln!(
                     "failed to load profile icon at {}: {err}. falling back to bundled icon",
                     icon_path.display()
@@ -270,15 +307,33 @@ pub(crate) fn load_tray_icon(config: &Config) -> Result<Icon, Box<dyn std::error
         }
     }
 
-    let bytes = include_bytes!("../assets/icon.png");
-    let image = image::load_from_memory(bytes)?;
-    let rgba = image.to_rgba8();
-    let (width, height) = rgba.dimensions();
-    Ok(Icon::from_rgba(rgba.into_raw(), width, height)?)
+    let image = image::load_from_memory(include_bytes!("../assets/icon.png"))?;
+    Ok(resolved_tray_icon_from_image(image.to_rgba8()))
+}
+
+pub(crate) fn rgba_to_argb_in_place(bytes: &mut [u8]) {
+    for pixel in bytes.chunks_exact_mut(4) {
+        pixel.rotate_right(1);
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn resolved_tray_icon_to_sni_pixmap(icon: &ResolvedTrayIcon) -> Vec<ksni::Icon> {
+    let mut argb = icon.rgba.clone();
+    rgba_to_argb_in_place(&mut argb);
+    vec![ksni::Icon {
+        width: icon.width as i32,
+        height: icon.height as i32,
+        data: argb,
+    }]
 }
 
 pub(crate) fn desktop_file_name(profile: &str) -> String {
-    format!("{APP_NAME}_{}.desktop", sanitize_profile_name(profile))
+    format!("{}.desktop", app_id_for_profile(profile))
+}
+
+pub(crate) fn app_id_for_profile(profile: &str) -> String {
+    format!("{APP_NAME}_{}", sanitize_profile_name(profile))
 }
 
 pub(crate) fn desktop_entry(
@@ -286,6 +341,7 @@ pub(crate) fn desktop_entry(
     icon_path: &Path,
     profile: &str,
     autostart: bool,
+    no_display: bool,
 ) -> String {
     let mut entry = String::from("[Desktop Entry]\n");
     entry.push_str("Type=Application\n");
@@ -300,12 +356,48 @@ pub(crate) fn desktop_entry(
     );
     entry.push_str(&format!("Exec={exec}\n"));
     entry.push_str(&format!("Icon={}\n", icon_path.to_string_lossy()));
+    entry.push_str(&format!("StartupWMClass={}\n", app_id_for_profile(profile)));
+    if no_display {
+        entry.push_str("NoDisplay=true\n");
+    }
     entry.push_str("Terminal=false\n");
     entry.push_str("Categories=Utility;\n");
     if autostart {
         entry.push_str("X-GNOME-Autostart-enabled=true\n");
     }
     entry
+}
+
+pub(crate) fn desktop_entry_is_visible(contents: &str) -> bool {
+    !contents.lines().any(|line| line.trim() == "NoDisplay=true")
+}
+
+pub(crate) fn ensure_hidden_identity_desktop_file(
+    profile: &str,
+    config: &Config,
+) -> Result<PathBuf, String> {
+    let exec_path = env::current_exe().map_err(|err| {
+        format!("unable to resolve executable path for identity desktop file: {err}")
+    })?;
+    let icon_path = resolve_icon_path_for_desktop(config)
+        .map_err(|err| format!("unable to resolve icon path for identity desktop file: {err}"))?;
+    let desktop_path = applications_desktop_path(profile)
+        .ok_or_else(|| "unable to resolve identity desktop path".to_string())?;
+
+    let no_display = match fs::read_to_string(&desktop_path) {
+        Ok(contents) => !desktop_entry_is_visible(&contents),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+        Err(err) => {
+            return Err(format!(
+                "unable to read existing identity desktop file at {}: {err}",
+                desktop_path.display()
+            ))
+        }
+    };
+
+    let contents = desktop_entry(&exec_path, &icon_path, profile, false, no_display);
+    write_desktop_file(&desktop_path, &contents)?;
+    Ok(desktop_path)
 }
 
 fn desktop_escape_arg(value: &str) -> String {
