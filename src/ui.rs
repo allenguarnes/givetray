@@ -1,8 +1,9 @@
-use crate::cli::should_expose_configuration;
+use crate::cli::{should_expose_configuration, tray_tooltip};
 use crate::config::save_configuration;
 use crate::desktop::{applications_desktop_path, apply_desktop_actions, autostart_desktop_path};
 use crate::logs::{
-    append_log, apply_process_exited, buffer_text, profile_lock_action_blocked_message,
+    append_log, apply_process_exited, buffer_text, logs_window_title,
+    profile_lock_action_blocked_message,
 };
 use crate::process::{can_control_profile, start_command, stop_command, stop_command_blocking};
 use crate::{AppState, ConfigCloseAction, UiEvent, MAX_UNDO};
@@ -19,12 +20,14 @@ use tray_icon::menu::MenuEvent;
 pub(crate) fn build_config_window(
     profile: &str,
     command: &str,
+    name: Option<&str>,
     autostart: bool,
     log_to_file: bool,
 ) -> (
     gtk::Window,
     gtk::TextView,
     gtk::TextBuffer,
+    gtk::Entry,
     gtk::CheckButton,
     gtk::CheckButton,
     gtk::CheckButton,
@@ -67,6 +70,20 @@ pub(crate) fn build_config_window(
     hint.set_margin_start(8);
     hint.set_margin_end(8);
     hint.set_margin_bottom(4);
+
+    let name_label = gtk::Label::new(Some("Name"));
+    name_label.set_halign(gtk::Align::Start);
+    name_label.set_margin_start(8);
+    name_label.set_margin_end(8);
+    name_label.set_margin_top(12);
+    name_label.set_margin_bottom(4);
+
+    let name_entry = gtk::Entry::new();
+    name_entry.set_margin_start(8);
+    name_entry.set_margin_end(8);
+    name_entry.set_hexpand(true);
+    name_entry.set_placeholder_text(Some("Optional human-readable tray name"));
+    name_entry.set_text(name.unwrap_or_default());
 
     let autostart_toggle =
         gtk::CheckButton::with_label("Run command automatically when givetray launches");
@@ -132,6 +149,8 @@ pub(crate) fn build_config_window(
     let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
     container.set_hexpand(true);
     container.set_vexpand(true);
+    container.pack_start(&name_label, false, false, 0);
+    container.pack_start(&name_entry, false, false, 0);
     container.pack_start(&label, false, false, 0);
     container.pack_start(&hint, false, false, 0);
     container.pack_start(&scroller, true, true, 0);
@@ -146,6 +165,7 @@ pub(crate) fn build_config_window(
         window,
         text_view,
         buffer,
+        name_entry,
         autostart_toggle,
         log_to_file_toggle,
         apps_toggle,
@@ -252,6 +272,7 @@ pub(crate) fn setup_config_handlers(state: Rc<RefCell<AppState>>) {
     let buffer = state.borrow().config_buffer.clone();
     let window = state.borrow().config_window.clone();
     let autostart_toggle = state.borrow().config_autostart.clone();
+    let name_entry = state.borrow().config_name_entry.clone();
     let log_to_file_toggle = state.borrow().config_log_to_file.clone();
     let save_button = state.borrow().config_save_button.clone();
     let apps_toggle = state.borrow().config_applications.clone();
@@ -260,6 +281,7 @@ pub(crate) fn setup_config_handlers(state: Rc<RefCell<AppState>>) {
     let state_close = state.clone();
     let buffer_close = buffer.clone();
     let autostart_toggle_close = autostart_toggle.clone();
+    let name_entry_close = name_entry.clone();
     let log_to_file_toggle_close = log_to_file_toggle.clone();
     let apps_toggle_close = apps_toggle.clone();
     let system_autostart_toggle_close = system_autostart_toggle.clone();
@@ -270,6 +292,7 @@ pub(crate) fn setup_config_handlers(state: Rc<RefCell<AppState>>) {
             config_has_unsaved_changes(
                 &app,
                 &current_text,
+                &name_entry_close.text(),
                 autostart_toggle_close.is_active(),
                 log_to_file_toggle_close.is_active(),
                 apps_toggle_close.is_active(),
@@ -287,6 +310,7 @@ pub(crate) fn setup_config_handlers(state: Rc<RefCell<AppState>>) {
                 let save_succeeded = save_from_config_widgets(
                     state_close.clone(),
                     &buffer_close,
+                    &name_entry_close,
                     &log_to_file_toggle_close,
                     &apps_toggle_close,
                     &system_autostart_toggle_close,
@@ -307,6 +331,7 @@ pub(crate) fn setup_config_handlers(state: Rc<RefCell<AppState>>) {
 
     let state_save = state.clone();
     let buffer_save = buffer.clone();
+    let name_entry_save = name_entry.clone();
     let log_to_file_toggle_save = log_to_file_toggle.clone();
     let apps_toggle_save = apps_toggle.clone();
     let system_autostart_save = system_autostart_toggle.clone();
@@ -314,6 +339,7 @@ pub(crate) fn setup_config_handlers(state: Rc<RefCell<AppState>>) {
         save_from_config_widgets(
             state_save.clone(),
             &buffer_save,
+            &name_entry_save,
             &log_to_file_toggle_save,
             &apps_toggle_save,
             &system_autostart_save,
@@ -357,6 +383,11 @@ pub(crate) fn setup_config_handlers(state: Rc<RefCell<AppState>>) {
     let state_system_toggled = state.clone();
     system_autostart_toggle.connect_toggled(move |_| {
         refresh_config_dirty_status(state_system_toggled.clone());
+    });
+
+    let state_name_changed = state.clone();
+    name_entry.connect_changed(move |_| {
+        refresh_config_dirty_status(state_name_changed.clone());
     });
 
     let state_keys = state.clone();
@@ -458,13 +489,26 @@ fn show_config_close_dialog(parent: &gtk::Window) -> ConfigCloseAction {
 fn save_from_config_widgets(
     state: Rc<RefCell<AppState>>,
     buffer: &gtk::TextBuffer,
+    name_entry: &gtk::Entry,
     log_to_file_toggle: &gtk::CheckButton,
     apps_toggle: &gtk::CheckButton,
     system_autostart_toggle: &gtk::CheckButton,
 ) -> bool {
     let text = buffer_text(buffer);
-    let saved = save_configuration(state.clone(), text, log_to_file_toggle.is_active());
+    let name_text = name_entry.text().to_string();
+    let autostart = state.borrow().config_autostart.is_active();
+    let saved = save_configuration(
+        state.clone(),
+        text,
+        name_text,
+        autostart,
+        log_to_file_toggle.is_active(),
+    );
     if saved {
+        {
+            let mut app = state.borrow_mut();
+            refresh_saved_display_state(&mut app);
+        }
         apply_desktop_actions(
             state.clone(),
             apps_toggle.is_active(),
@@ -476,19 +520,45 @@ fn save_from_config_widgets(
     saved
 }
 
+fn refresh_saved_display_state(state: &mut AppState) {
+    state
+        .logs_window
+        .set_title(&logs_window_title(state.display_name.as_deref()));
+    let tooltip = tray_tooltip(&state.run_target, state.display_name.as_deref());
+    state.tray_name_item.set_text(&tooltip);
+    if let Some(tray_icon) = state.tray_icon.as_ref() {
+        if let Err(err) = tray_icon.set_tooltip(Some(tooltip.as_str())) {
+            eprintln!("failed to update tray tooltip: {err}");
+        }
+        #[cfg(target_os = "linux")]
+        tray_icon.set_title(Some(tooltip.as_str()));
+    }
+}
+
 fn config_has_unsaved_changes(
     state: &AppState,
     current_command: &str,
+    current_name: &str,
     current_autostart: bool,
     current_log_to_file: bool,
     current_applications: bool,
     current_system_autostart: bool,
 ) -> bool {
+    let name_is_dirty = name_field_has_unsaved_changes(&state.saved_name, current_name);
+
     current_command != state.saved_command
+        || name_is_dirty
         || current_autostart != state.saved_autostart
         || current_log_to_file != state.saved_log_to_file
         || current_applications != state.config_saved_applications
         || current_system_autostart != state.config_saved_system_autostart
+}
+
+pub(crate) fn name_field_has_unsaved_changes(saved_name: &Option<String>, current_name: &str) -> bool {
+    match crate::config::parse_optional_display_name(current_name) {
+        Ok(current_name) => current_name != *saved_name,
+        Err(_) => !current_name.trim().is_empty(),
+    }
 }
 
 pub(crate) fn refresh_config_dirty_status(state: Rc<RefCell<AppState>>) {
@@ -502,6 +572,7 @@ pub(crate) fn refresh_config_dirty_status(state: Rc<RefCell<AppState>>) {
         let unsaved = config_has_unsaved_changes(
             &app,
             &command,
+            &app.config_name_entry.text(),
             app.config_autostart.is_active(),
             app.config_log_to_file.is_active(),
             app.config_applications.is_active(),
@@ -596,9 +667,11 @@ pub(crate) fn setup_menu_polling(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiE
                     window,
                     view,
                     buffer,
+                    name_entry,
                     autostart_toggle,
                     log_to_file_toggle,
                     command,
+                    saved_name,
                     autostart,
                     log_to_file,
                 ) = {
@@ -607,9 +680,11 @@ pub(crate) fn setup_menu_polling(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiE
                         state.config_window.clone(),
                         state.config_view.clone(),
                         state.config_buffer.clone(),
+                        state.config_name_entry.clone(),
                         state.config_autostart.clone(),
                         state.config_log_to_file.clone(),
                         state.saved_command.clone(),
+                        state.saved_name.clone(),
                         state.saved_autostart,
                         state.saved_log_to_file,
                     )
@@ -629,6 +704,7 @@ pub(crate) fn setup_menu_polling(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiE
                     state.config_redo.clear();
                 }
                 buffer.set_text(&command);
+                name_entry.set_text(saved_name.as_deref().unwrap_or_default());
                 autostart_toggle.set_active(autostart);
                 log_to_file_toggle.set_active(log_to_file);
                 refresh_desktop_toggles(state.clone(), &apps_toggle, &system_autostart_toggle);

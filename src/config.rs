@@ -2,11 +2,10 @@ use crate::desktop::copy_icon_to_profile;
 use crate::logs::{append_log, profile_lock_action_blocked_message};
 use crate::{
     AppState, CliOptions, Config, RuntimeOwnershipState, APP_NAME, DEFAULT_COMMAND,
-    DEFAULT_PROFILE, MAX_COMMAND_LENGTH, RUNTIME_INVALID_CLEARED_MESSAGE, RUNTIME_RESTORED_MESSAGE,
-    RUNTIME_STALE_CLEARED_MESSAGE,
+    DEFAULT_PROFILE, MAX_COMMAND_LENGTH, MAX_DISPLAY_NAME_LENGTH, RUNTIME_INVALID_CLEARED_MESSAGE,
+    RUNTIME_RESTORED_MESSAGE, RUNTIME_STALE_CLEARED_MESSAGE,
 };
 use directories::ProjectDirs;
-use gtk::prelude::*;
 use std::cell::RefCell;
 use std::fs;
 use std::io::Write;
@@ -56,6 +55,7 @@ pub(crate) fn load_or_create_config(path: &PathBuf) -> Config {
     let default = Config {
         command: DEFAULT_COMMAND.to_string(),
         autostart: false,
+        name: None,
         icon_path: None,
         log_to_file: false,
         log_file_path: None,
@@ -202,6 +202,13 @@ pub(crate) fn apply_cli_overrides_to_config(
         }
     }
 
+    if let Some(name) = cli.name_override.as_ref() {
+        if config.name.as_deref() != Some(name.as_str()) {
+            config.name = Some(name.clone());
+            changed = true;
+        }
+    }
+
     if let Some(source_path) = cli.icon_source.as_ref() {
         let profile = cli
             .persistent_profile()
@@ -239,6 +246,8 @@ pub(crate) fn apply_cli_overrides_to_config(
 pub(crate) fn save_configuration(
     state: Rc<RefCell<AppState>>,
     text: String,
+    name_text: String,
+    autostart_enabled: bool,
     log_to_file_enabled: bool,
 ) -> bool {
     let mut state = state.borrow_mut();
@@ -254,39 +263,36 @@ pub(crate) fn save_configuration(
         );
         return false;
     };
-    let text = match validate_saved_command_text(&text) {
-        Ok(command) => command,
+    let computed = match build_saved_configuration(
+        &access.profile,
+        state.saved_icon_path.clone(),
+        state.saved_log_file_path.clone(),
+        &text,
+        &name_text,
+        autostart_enabled,
+        log_to_file_enabled,
+    ) {
+        Ok(computed) => computed,
         Err(err) => {
             append_log(&mut state, err);
             return false;
         }
     };
-    let new_autostart = state.config_autostart.is_active();
-    let mut new_log_file_path = state.saved_log_file_path.clone();
-    if log_to_file_enabled && new_log_file_path.is_none() {
-        new_log_file_path =
-            default_log_file_path(&access.profile).map(|path| path.to_string_lossy().to_string());
-    }
-    let new_config = Config {
-        command: text.clone(),
-        autostart: new_autostart,
-        icon_path: state.saved_icon_path.clone(),
-        log_to_file: log_to_file_enabled,
-        log_file_path: new_log_file_path.clone(),
-    };
 
-    if let Err(err) = save_config(&access.config_path, &new_config) {
+    if let Err(err) = save_config(&access.config_path, &computed.config) {
         append_log(&mut state, format!("Failed to save configuration: {err}"));
         return false;
     }
 
-    state.command = text.clone();
-    state.config_last = text.clone();
-    state.saved_command = text;
-    state.saved_autostart = new_autostart;
-    state.saved_log_to_file = log_to_file_enabled;
-    state.saved_log_file_path = new_log_file_path;
-    let next_log_file_path = if log_to_file_enabled {
+    state.command = computed.command.clone();
+    state.config_last = computed.command.clone();
+    state.saved_command = computed.command;
+    state.saved_autostart = computed.autostart;
+    state.saved_name = computed.name;
+    state.display_name = state.saved_name.clone();
+    state.saved_log_to_file = computed.log_to_file;
+    state.saved_log_file_path = computed.log_file_path;
+    let next_log_file_path = if computed.log_to_file {
         state.saved_log_file_path.as_ref().map(PathBuf::from)
     } else {
         None
@@ -309,6 +315,93 @@ pub(crate) fn save_configuration(
     }
 
     true
+}
+
+#[derive(Debug)]
+pub(crate) struct SavedConfiguration {
+    pub(crate) command: String,
+    pub(crate) autostart: bool,
+    pub(crate) name: Option<String>,
+    pub(crate) log_to_file: bool,
+    pub(crate) log_file_path: Option<String>,
+    pub(crate) config: Config,
+}
+
+pub(crate) fn build_saved_configuration(
+    profile: &str,
+    icon_path: Option<String>,
+    saved_log_file_path: Option<String>,
+    command_text: &str,
+    name_text: &str,
+    autostart_enabled: bool,
+    log_to_file_enabled: bool,
+) -> Result<SavedConfiguration, String> {
+    let command = validate_saved_command_text(command_text)?;
+    let name = parse_optional_display_name(name_text)?;
+
+    let mut log_file_path = saved_log_file_path;
+    if log_to_file_enabled && log_file_path.is_none() {
+        log_file_path = default_log_file_path(profile).map(|path| path.to_string_lossy().to_string());
+    }
+
+    Ok(SavedConfiguration {
+        config: Config {
+            command: command.clone(),
+            autostart: autostart_enabled,
+            name: name.clone(),
+            icon_path,
+            log_to_file: log_to_file_enabled,
+            log_file_path: log_file_path.clone(),
+        },
+        command,
+        autostart: autostart_enabled,
+        name,
+        log_to_file: log_to_file_enabled,
+        log_file_path,
+    })
+}
+
+pub(crate) fn normalize_display_name(raw: &str) -> Option<String> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return None;
+    }
+    if name.len() > MAX_DISPLAY_NAME_LENGTH {
+        return None;
+    }
+    if name.chars().any(|ch| ch.is_control()) {
+        return None;
+    }
+
+    Some(name.to_string())
+}
+
+pub(crate) fn normalize_saved_display_name(raw: Option<&str>) -> Option<String> {
+    raw.and_then(normalize_display_name)
+}
+
+pub(crate) fn parse_optional_display_name(raw: &str) -> Result<Option<String>, String> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Ok(None);
+    }
+    if name.len() > MAX_DISPLAY_NAME_LENGTH {
+        return Err(format!(
+            "name is too long (max {MAX_DISPLAY_NAME_LENGTH} characters)"
+        ));
+    }
+    if name.chars().any(|ch| ch.is_control()) {
+        return Err("name cannot contain control characters".to_string());
+    }
+
+    Ok(Some(name.to_string()))
+}
+
+pub(crate) fn validate_display_name_override(raw: &str) -> Result<String, String> {
+    match parse_optional_display_name(raw)? {
+        Some(name) => Ok(name),
+        None => Err("name cannot be empty".to_string()),
+    }
 }
 
 pub(crate) fn can_save_profile_configuration(owns_profile_lock: bool) -> bool {

@@ -2,7 +2,8 @@ use crate::config::{
     acquire_profile_lock, apply_cli_overrides_to_config, clear_runtime_state,
     config_path_for_profile, load_or_create_config, load_runtime_state_result,
     profile_lock_path_for_profile, resolve_log_file_path, runtime_state_path_for_ephemeral,
-    runtime_state_path_for_profile, save_config, validate_saved_command_text,
+    runtime_state_path_for_profile, save_config, validate_display_name_override,
+    validate_saved_command_text,
     RuntimeStateLoadResult,
 };
 use crate::{
@@ -80,6 +81,10 @@ pub(crate) fn build_detached_args(cli: &CliOptions) -> Vec<String> {
     match &cli.run_target {
         CliRunTarget::PersistentProfile { profile } => {
             let mut args = vec!["--config".to_string(), profile.clone()];
+            if let Some(name_override) = &cli.name_override {
+                args.push("--name".to_string());
+                args.push(name_override.clone());
+            }
             if let Some(command_override) = &cli.command_override {
                 args.push("--command".to_string());
                 args.push(command_override.clone());
@@ -95,7 +100,11 @@ pub(crate) fn build_detached_args(cli: &CliOptions) -> Vec<String> {
             args
         }
         CliRunTarget::EphemeralArgv { argv } => {
-            let mut args = Vec::with_capacity(argv.len() + 1);
+            let mut args = Vec::with_capacity(argv.len() + 3);
+            if let Some(name_override) = &cli.name_override {
+                args.push("--name".to_string());
+                args.push(name_override.clone());
+            }
             args.push("--".to_string());
             args.extend(argv.iter().cloned());
             args
@@ -103,7 +112,10 @@ pub(crate) fn build_detached_args(cli: &CliOptions) -> Vec<String> {
     }
 }
 
-pub(crate) fn tray_tooltip(run_target: &CliRunTarget) -> String {
+pub(crate) fn tray_tooltip(run_target: &CliRunTarget, display_name: Option<&str>) -> String {
+    if let Some(display_name) = display_name {
+        return display_name.to_string();
+    }
     format!("{APP_NAME} ({})", run_target_label(run_target))
 }
 
@@ -151,10 +163,11 @@ fn shell_command_token(arg: &str) -> String {
     format!("'{escaped}'")
 }
 
-pub(crate) fn ephemeral_runtime_config(argv: &[String]) -> Config {
+pub(crate) fn ephemeral_runtime_config(argv: &[String], display_name: Option<String>) -> Config {
     Config {
         command: ephemeral_command_text(argv),
         autostart: false,
+        name: display_name,
         icon_path: None,
         log_to_file: false,
         log_file_path: None,
@@ -185,6 +198,7 @@ fn load_config_without_side_effects(path: &Path) -> Config {
     let default = Config {
         command: DEFAULT_COMMAND.to_string(),
         autostart: false,
+        name: None,
         icon_path: None,
         log_to_file: false,
         log_file_path: None,
@@ -218,17 +232,24 @@ pub(crate) fn build_startup_state(cli: &CliOptions) -> Result<StartupState, Stri
                 prepare_readonly_preflight_for_persistent_profile(profile)?
             };
 
-            complete_persistent_startup(preflight, owns_profile_lock, profile_lock)
+            complete_persistent_startup(
+                preflight,
+                cli.name_override.as_deref(),
+                owns_profile_lock,
+                profile_lock,
+            )
         }
         CliRunTarget::EphemeralArgv { argv } => {
             let runtime_state_path = runtime_state_path_for_ephemeral();
             let (runtime_ownership, startup_message) =
                 load_startup_runtime_state(runtime_state_path.as_deref());
+            let display_name = cli.name_override.clone();
 
             Ok(StartupState {
                 profile_label: run_target_label(&cli.run_target),
+                display_name: display_name.clone(),
                 persistent_config_access: None,
-                config: ephemeral_runtime_config(argv),
+                config: ephemeral_runtime_config(argv, display_name),
                 log_file_path: None,
                 launch_on_startup: true,
                 runtime_state_path,
@@ -280,6 +301,7 @@ fn prepare_readonly_preflight_for_persistent_profile(
 
 pub(crate) fn complete_persistent_startup(
     preflight: PreflightState,
+    cli_name_override: Option<&str>,
     owns_profile_lock: bool,
     profile_lock: Option<crate::config::ProfileLockHandle>,
 ) -> Result<StartupState, String> {
@@ -288,6 +310,7 @@ pub(crate) fn complete_persistent_startup(
         config_path,
         config,
     } = preflight;
+    let display_name = resolve_display_name(cli_name_override, config.name.as_deref());
 
     let (runtime_ownership, startup_message) = if owns_profile_lock {
         let runtime_state_path = runtime_state_path_for_profile(&profile);
@@ -298,6 +321,7 @@ pub(crate) fn complete_persistent_startup(
 
     Ok(StartupState {
         profile_label: profile.clone(),
+        display_name,
         persistent_config_access: persistent_config_access(
             Some(profile.clone()),
             Some(config_path),
@@ -357,7 +381,12 @@ where
             } else {
                 prepare_readonly_preflight_for_persistent_profile(profile)?
             };
-            complete_persistent_startup(preflight, owns_profile_lock, profile_lock)
+            complete_persistent_startup(
+                preflight,
+                cli.name_override.as_deref(),
+                owns_profile_lock,
+                profile_lock,
+            )
         }
         CliRunTarget::EphemeralArgv { .. } => {
             detach(cli).map_err(|err| format!("failed to start background instance: {err}"))?;
@@ -482,23 +511,47 @@ where
     S: Into<String>,
 {
     let args: Vec<String> = args.into_iter().map(Into::into).collect();
+    if let Ok(cli) = parse_cli_args_from(args.clone()) {
+        return Ok(CliRequest::Run(cli));
+    }
+
     let raw_args = args.get(1..).unwrap_or(&[]);
     let option_args = match raw_args.iter().position(|arg| arg == "--") {
         Some(separator_index) => &raw_args[..separator_index],
         None => raw_args,
     };
 
-    if option_args.iter().any(|arg| arg == "-h" || arg == "--help") {
-        return Ok(CliRequest::PrintHelp);
-    }
-    if option_args
-        .iter()
-        .any(|arg| arg == "-V" || arg == "--version")
-    {
-        return Ok(CliRequest::PrintVersion);
+    let mut skip_next = false;
+    for arg in option_args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+
+        if arg == "-h" || arg == "--help" {
+            return Ok(CliRequest::PrintHelp);
+        }
+        if arg == "-V" || arg == "--version" {
+            return Ok(CliRequest::PrintVersion);
+        }
+
+        if matches!(
+            arg.as_str(),
+            "-c"
+                | "--config"
+                | "-cmd"
+                | "--command"
+                | "-n"
+                | "--name"
+                | "--icon"
+                | "--log-file"
+                | "--output-dir"
+        ) {
+            skip_next = true;
+        }
     }
 
-    Ok(CliRequest::Run(parse_cli_args_from(args)?))
+    parse_cli_args_from(args).map(CliRequest::Run)
 }
 
 pub(crate) fn parse_cli_args_from<I, S>(args: I) -> Result<CliOptions, String>
@@ -550,13 +603,30 @@ where
         {
             return Err(format!("{flag} is only valid with desktop-file"));
         }
-        if let Some(unknown) = prefix.first() {
-            return Err(format!("unknown argument: {unknown}"));
+        let mut name_override: Option<String> = None;
+        let mut i = 0usize;
+        while i < prefix.len() {
+            match prefix[i].as_str() {
+                "-n" | "--name" => {
+                    let value = prefix
+                        .get(i + 1)
+                        .ok_or_else(|| "missing value for -n/--name".to_string())?;
+                    if name_override.is_some() {
+                        return Err("-n/--name provided more than once".to_string());
+                    }
+                    name_override = Some(validate_display_name(value)?);
+                    i += 2;
+                }
+                unknown => {
+                    return Err(format!("unknown argument: {unknown}"));
+                }
+            }
         }
 
         return Ok(CliOptions {
             run_target: CliRunTarget::EphemeralArgv { argv },
             command_override: None,
+            name_override,
             icon_source: None,
             log_file: None,
             mode,
@@ -565,6 +635,7 @@ where
 
     let mut profile: Option<String> = None;
     let mut command_override: Option<String> = None;
+    let mut name_override: Option<String> = None;
     let mut icon_source = None;
     let mut log_file = None;
 
@@ -589,6 +660,16 @@ where
                     return Err("-cmd/--command provided more than once".to_string());
                 }
                 command_override = Some(validate_command_override(value)?);
+                i += 2;
+            }
+            "-n" | "--name" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "missing value for -n/--name".to_string())?;
+                if name_override.is_some() {
+                    return Err("-n/--name provided more than once".to_string());
+                }
+                name_override = Some(validate_display_name(value)?);
                 i += 2;
             }
             "--icon" => {
@@ -649,6 +730,7 @@ where
     Ok(CliOptions {
         run_target: CliRunTarget::PersistentProfile { profile },
         command_override,
+        name_override,
         icon_source,
         log_file,
         mode,
@@ -666,9 +748,9 @@ pub(crate) fn validate_runtime_mode(cli: &CliOptions) -> Result<(), String> {
 }
 
 const HELP_USAGE_LINES: [&str; 3] = [
-    "  {name} -c PROFILE [-cmd COMMAND|--command COMMAND] [--icon ICON_PATH] [--log-file LOG_PATH]",
-    "  {name} -- <command...>",
-    "  {name} desktop-file -c PROFILE [-cmd COMMAND|--command COMMAND] [--output-dir DIR] [--autostart] [--icon ICON_PATH]",
+    "  {name} -c PROFILE [-n NAME|--name NAME] [-cmd COMMAND|--command COMMAND] [--icon ICON_PATH] [--log-file LOG_PATH]",
+    "  {name} [-n NAME|--name NAME] -- <command...>",
+    "  {name} desktop-file -c PROFILE [-n NAME|--name NAME] [-cmd COMMAND|--command COMMAND] [--output-dir DIR] [--autostart] [--icon ICON_PATH]",
 ];
 
 const HELP_MODE_LINES: [&str; 3] = [
@@ -677,8 +759,9 @@ const HELP_MODE_LINES: [&str; 3] = [
     "                           Starts immediately and keeps tray Start/Stop; Configuration is hidden",
 ];
 
-const HELP_OPTION_LINES: [&str; 8] = [
+const HELP_OPTION_LINES: [&str; 9] = [
     "  -c, --config PROFILE    Required profile name (letters, numbers, '-' or '_')",
+    "  -n, --name NAME         Human-readable tray name (persisted for profiles)",
     "  -cmd, --command COMMAND Set or overwrite saved command for the profile",
     "      --icon ICON_PATH    Copy icon into the selected profile and update config",
     "      --log-file LOG_PATH Enable log-to-file and set output path (app mode only)",
@@ -741,4 +824,18 @@ fn validate_command_override(raw: &str) -> Result<String, String> {
         }
         Err(err) => Err(err),
     }
+}
+
+fn normalize_display_name(raw: &str) -> Option<String> {
+    crate::config::normalize_display_name(raw)
+}
+
+fn resolve_display_name(cli_name_override: Option<&str>, config_name: Option<&str>) -> Option<String> {
+    cli_name_override
+        .and_then(normalize_display_name)
+        .or_else(|| config_name.and_then(normalize_display_name))
+}
+
+fn validate_display_name(raw: &str) -> Result<String, String> {
+    validate_display_name_override(raw)
 }

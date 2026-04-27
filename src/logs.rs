@@ -31,7 +31,7 @@ pub(crate) fn clear_runtime_state_after_exit(runtime_state_path: Option<&Path>) 
     }
 }
 
-pub(crate) fn build_logs_window() -> (
+pub(crate) fn build_logs_window(display_name: Option<&str>) -> (
     gtk::Window,
     gtk::TextView,
     gtk::TextBuffer,
@@ -43,7 +43,7 @@ pub(crate) fn build_logs_window() -> (
     gtk::Label,
 ) {
     let window = gtk::Window::new(gtk::WindowType::Toplevel);
-    window.set_title("Logs");
+    window.set_title(&logs_window_title(display_name));
     window.set_default_size(820, 520);
 
     let tag_table = gtk::TextTagTable::new();
@@ -158,6 +158,13 @@ pub(crate) fn build_logs_window() -> (
         restart_button,
         status_label,
     )
+}
+
+pub(crate) fn logs_window_title(display_name: Option<&str>) -> String {
+    match display_name {
+        Some(name) => format!("Logs ({name})"),
+        None => "Logs".to_string(),
+    }
 }
 
 pub(crate) fn setup_logs_handlers(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>) {

@@ -11,7 +11,7 @@ use crate::cli::{
     parse_cli_args, prepare_run_startup, should_expose_configuration, tray_tooltip,
     validate_runtime_mode,
 };
-use crate::config::{reconcile_startup_runtime_state, ProfileLockHandle};
+use crate::config::{normalize_saved_display_name, reconcile_startup_runtime_state, ProfileLockHandle};
 use crate::desktop::{create_desktop_file_from_cli, load_tray_icon, load_window_icon_pixbuf};
 use crate::logs::{build_logs_window, setup_log_receiver, setup_logs_handlers};
 use crate::process::start_command;
@@ -69,6 +69,7 @@ const UI_EVENT_CHANNEL_CAPACITY: usize = 750;
 const MAX_UNDO: usize = 200;
 const MAX_COMMAND_LENGTH: usize = 8192;
 const MAX_PROFILE_LENGTH: usize = 128;
+const MAX_DISPLAY_NAME_LENGTH: usize = 128;
 const ICON_FILE_NAME: &str = "icon.png";
 const BUNDLED_ICON_FILE_NAME: &str = "default-icon.png";
 const BG_CHILD_ENV: &str = "GIVETRAY_BG_CHILD";
@@ -90,6 +91,7 @@ pub(crate) fn coalesced_log_overflow_message(count: usize) -> String {
 struct CliOptions {
     run_target: CliRunTarget,
     command_override: Option<String>,
+    name_override: Option<String>,
     icon_source: Option<PathBuf>,
     log_file: Option<PathBuf>,
     mode: CliMode,
@@ -132,6 +134,8 @@ struct Config {
     #[serde(default)]
     autostart: bool,
     #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
     icon_path: Option<String>,
     #[serde(default)]
     log_to_file: bool,
@@ -147,10 +151,14 @@ enum UiEvent {
 }
 
 struct AppState {
+    run_target: CliRunTarget,
+    tray_icon: Option<tray_icon::TrayIcon>,
     persistent_config_access: Option<PersistentConfigAccess>,
+    display_name: Option<String>,
     command: String,
     saved_command: String,
     saved_autostart: bool,
+    saved_name: Option<String>,
     saved_icon_path: Option<String>,
     saved_log_to_file: bool,
     saved_log_file_path: Option<String>,
@@ -179,6 +187,7 @@ struct AppState {
     config_window: gtk::Window,
     config_view: gtk::TextView,
     config_buffer: gtk::TextBuffer,
+    config_name_entry: gtk::Entry,
     config_autostart: gtk::CheckButton,
     config_log_to_file: gtk::CheckButton,
     config_applications: gtk::CheckButton,
@@ -191,6 +200,7 @@ struct AppState {
     config_redo: Vec<String>,
     config_last: String,
     config_ignore: bool,
+    tray_name_item: MenuItem,
     start_stop_item: MenuItem,
 }
 
@@ -216,6 +226,7 @@ struct PersistentConfigAccess {
 
 struct StartupState {
     profile_label: String,
+    display_name: Option<String>,
     persistent_config_access: Option<PersistentConfigAccess>,
     config: Config,
     log_file_path: Option<PathBuf>,
@@ -304,11 +315,14 @@ fn main() {
         logs_stop_button,
         logs_restart_button,
         logs_status_label,
-    ) = build_logs_window();
+    ) = build_logs_window(startup.display_name.as_deref());
+    let initial_saved_name = normalize_saved_display_name(startup.config.name.as_deref());
+
     let (
         config_window,
         config_view,
         config_buffer,
+        config_name_entry,
         config_autostart,
         config_log_to_file,
         config_applications,
@@ -318,6 +332,7 @@ fn main() {
     ) = build_config_window(
         &startup.profile_label,
         &startup.config.command,
+        initial_saved_name.as_deref(),
         startup.config.autostart,
         startup.config.log_to_file,
     );
@@ -331,12 +346,16 @@ fn main() {
 
     let (ui_tx, ui_rx) = async_channel::bounded::<UiEvent>(UI_EVENT_CHANNEL_CAPACITY);
 
+    let tooltip = tray_tooltip(&cli.run_target, startup.display_name.as_deref());
+
+    let name_id = MenuId::new("name");
     let start_stop_id = MenuId::new("start-stop");
     let logs_id = MenuId::new("logs");
     let configure_id = MenuId::new("configure");
     let about_id = MenuId::new("about");
     let exit_id = MenuId::new("exit");
 
+    let name_item = MenuItem::with_id(name_id.clone(), &tooltip, false, None);
     let start_stop_item = MenuItem::with_id(
         start_stop_id.clone(),
         initial_start_stop_label(startup.restored_running),
@@ -349,6 +368,7 @@ fn main() {
     let exit_item = MenuItem::with_id(exit_id.clone(), "Exit", true, None);
 
     let tray_menu = Menu::new();
+    tray_menu.append(&name_item).expect("menu append failed");
     tray_menu
         .append(&start_stop_item)
         .expect("menu append failed");
@@ -365,21 +385,29 @@ fn main() {
     tray_menu.append(&exit_item).expect("menu append failed");
 
     let tray_icon = load_tray_icon(&startup.config).expect("failed to load tray icon");
-    let tooltip = tray_tooltip(&cli.run_target);
     let should_launch = should_launch_on_startup(&startup);
     let startup_message = startup.startup_message.clone();
-    let _tray = TrayIconBuilder::new()
+    let mut tray_icon_builder = TrayIconBuilder::new()
         .with_menu(Box::new(tray_menu))
         .with_tooltip(&tooltip)
-        .with_icon(tray_icon)
+        .with_icon(tray_icon);
+    #[cfg(target_os = "linux")]
+    {
+        tray_icon_builder = tray_icon_builder.with_title(&tooltip);
+    }
+    let tray_icon = tray_icon_builder
         .build()
         .expect("failed to create tray icon");
 
     let state = Rc::new(RefCell::new(AppState {
+        run_target: cli.run_target.clone(),
+        tray_icon: Some(tray_icon),
         persistent_config_access: startup.persistent_config_access,
+        display_name: startup.display_name.clone(),
         command: startup.config.command.clone(),
         saved_command: startup.config.command.clone(),
         saved_autostart: startup.config.autostart,
+        saved_name: initial_saved_name,
         saved_icon_path: startup.config.icon_path.clone(),
         saved_log_to_file: startup.config.log_to_file,
         saved_log_file_path: startup.config.log_file_path.clone(),
@@ -408,6 +436,7 @@ fn main() {
         config_window,
         config_view,
         config_buffer,
+        config_name_entry,
         config_autostart,
         config_log_to_file,
         config_applications,
@@ -420,11 +449,13 @@ fn main() {
         config_redo: Vec::new(),
         config_last: startup.config.command,
         config_ignore: false,
+        tray_name_item: name_item,
         start_stop_item,
     }));
 
     {
         let app = state.borrow();
+        let _ = app.display_name.as_deref();
         debug_assert!(app.owns_profile_lock || app.profile_lock.is_none());
     }
 

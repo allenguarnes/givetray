@@ -6,120 +6,34 @@ use crate::cli::{
 };
 use crate::config::config_path_for_profile;
 use crate::config::{
-    acquire_profile_lock, atomic_write, can_save_profile_configuration, clear_runtime_state,
-    load_runtime_state, profile_lock_path_for_profile, reconcile_startup_runtime_state,
+    acquire_profile_lock, apply_cli_overrides_to_config, atomic_write, build_saved_configuration,
+    can_save_profile_configuration, clear_runtime_state, load_or_create_config, load_runtime_state,
+    parse_optional_display_name, profile_lock_path_for_profile, reconcile_startup_runtime_state,
     runtime_state_path_for_ephemeral, runtime_state_path_for_profile, save_config,
-    save_configuration, save_runtime_state, validate_saved_command_text,
+    save_runtime_state, validate_saved_command_text,
 };
 use crate::desktop::create_desktop_file_from_cli;
 use crate::logs::{
-    append_log_to_file, clear_runtime_state_after_exit, extract_log_links,
+    append_log_to_file, clear_runtime_state_after_exit, extract_log_links, logs_window_title,
     should_activate_log_link, strip_ansi_codes,
 };
 use crate::process::can_control_profile;
 use crate::process::is_process_group_alive;
 use crate::process::reconcile_runtime_state;
 use crate::process::RuntimeReconcileResult;
+use crate::ui::name_field_has_unsaved_changes;
 use crate::*;
 use std::env;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::{Mutex, Once};
+use std::sync::Mutex;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
-static GTK_INIT: Once = Once::new();
-
-fn ensure_gtk_initialized() {
-    GTK_INIT.call_once(|| {
-        gtk::init().expect("gtk should initialize for ui-backed tests");
-    });
-}
-
-fn build_save_test_state(temp_root: &Path) -> Rc<RefCell<AppState>> {
-    ensure_gtk_initialized();
-
-    let profile = "save-test";
-    let config_path = temp_root.join("config").join("save-test.toml");
-    let (
-        logs_window,
-        logs_view,
-        logs_buffer,
-        logs_clear_button,
-        logs_copy_button,
-        logs_status_label,
-    ) = crate::logs::build_logs_window();
-    let (
-        config_window,
-        config_view,
-        config_buffer,
-        config_autostart,
-        config_log_to_file,
-        config_applications,
-        config_system_autostart,
-        config_save_button,
-        config_status_label,
-    ) = crate::ui::build_config_window(profile, "echo ready", false, false);
-    let about_window = crate::ui::build_about_window(None);
-    let start_stop_item = tray_icon::menu::MenuItem::with_id(
-        tray_icon::menu::MenuId::new("test-start-stop"),
-        "Start",
-        true,
-        None,
-    );
-
-    Rc::new(RefCell::new(AppState {
-        persistent_config_access: Some(PersistentConfigAccess {
-            profile: profile.to_string(),
-            config_path,
-        }),
-        command: "echo ready".to_string(),
-        saved_command: "echo ready".to_string(),
-        saved_autostart: false,
-        saved_icon_path: None,
-        saved_log_to_file: false,
-        saved_log_file_path: None,
-        child: None,
-        owned_pgid: None,
-        owned_pid: None,
-        process_exit_reported: false,
-        runtime_state_path: None,
-        restored_running: false,
-        owns_profile_lock: true,
-        profile_lock: None,
-        log_lines: VecDeque::new(),
-        log_links: VecDeque::new(),
-        log_file_path: None,
-        log_file_writer: None,
-        logs_window,
-        logs_view,
-        logs_buffer,
-        logs_clear_button,
-        logs_copy_button,
-        logs_status_label,
-        about_window,
-        config_window,
-        config_view,
-        config_buffer,
-        config_autostart,
-        config_log_to_file,
-        config_applications,
-        config_system_autostart,
-        config_save_button,
-        config_status_label,
-        config_saved_applications: false,
-        config_saved_system_autostart: false,
-        config_undo: Vec::new(),
-        config_redo: Vec::new(),
-        config_last: "echo ready".to_string(),
-        config_ignore: false,
-        start_stop_item,
-    }))
-}
 
 struct TestEnvGuard {
     home: Option<String>,
@@ -179,7 +93,7 @@ fn unique_test_dir(name: &str) -> PathBuf {
 fn help_text_documents_ephemeral_mode() {
     let help = help_text();
 
-    assert!(help.contains("Usage:\n  givetray -c PROFILE [-cmd COMMAND|--command COMMAND] [--icon ICON_PATH] [--log-file LOG_PATH]\n  givetray -- <command...>\n  givetray desktop-file -c PROFILE [-cmd COMMAND|--command COMMAND] [--output-dir DIR] [--autostart] [--icon ICON_PATH]"));
+    assert!(help.contains("Usage:\n  givetray -c PROFILE [-n NAME|--name NAME] [-cmd COMMAND|--command COMMAND] [--icon ICON_PATH] [--log-file LOG_PATH]\n  givetray [-n NAME|--name NAME] -- <command...>\n  givetray desktop-file -c PROFILE [-n NAME|--name NAME] [-cmd COMMAND|--command COMMAND] [--output-dir DIR] [--autostart] [--icon ICON_PATH]"));
     assert!(help.contains("Modes:\n  Persistent profile mode  Saved config, desktop entry support, and Configuration access\n  Ephemeral mode           Temporary, profile-free command launch via -- <command...>\n                           Starts immediately and keeps tray Start/Stop; Configuration is hidden"));
 }
 
@@ -206,6 +120,75 @@ fn parse_ephemeral_mode() {
             if argv == &["echo".to_string(), "hello world".to_string()]
     ));
     assert!(matches!(cli.mode, CliMode::Run));
+}
+
+#[test]
+fn parse_persistent_mode_with_name_override() {
+    let cli = parse_cli_args_from(["givetray", "-c", "default", "--name", "Desk Rig"])
+        .expect("persistent mode with name should parse");
+
+    assert_eq!(cli.name_override.as_deref(), Some("Desk Rig"));
+}
+
+#[test]
+fn parse_ephemeral_mode_with_name_override() {
+    let cli = parse_cli_args_from(["givetray", "--name", "Desk Rig", "--", "echo", "hello"])
+        .expect("ephemeral mode with name should parse");
+
+    assert_eq!(cli.name_override.as_deref(), Some("Desk Rig"));
+}
+
+#[test]
+fn parse_request_treats_help_like_name_values_as_run_in_persistent_mode() {
+    for value in ["-h", "--help", "-V", "--version"] {
+        let request = parse_cli_request_from(["givetray", "-c", "default", "--name", value])
+            .expect("persistent mode with name value should parse as run");
+
+        let cli = match request {
+            CliRequest::Run(cli) => cli,
+            CliRequest::PrintHelp => panic!("name value {value:?} must not be intercepted as help"),
+            CliRequest::PrintVersion => {
+                panic!("name value {value:?} must not be intercepted as version")
+            }
+        };
+
+        assert_eq!(cli.name_override.as_deref(), Some(value));
+        assert!(matches!(
+            cli.run_target,
+            CliRunTarget::PersistentProfile { ref profile } if profile == "default"
+        ));
+    }
+}
+
+#[test]
+fn parse_request_treats_help_like_name_values_as_run_in_ephemeral_mode() {
+    for value in ["-h", "--help", "-V", "--version"] {
+        let request = parse_cli_request_from(["givetray", "--name", value, "--", "echo", "ok"])
+            .expect("ephemeral mode with name value should parse as run");
+
+        let cli = match request {
+            CliRequest::Run(cli) => cli,
+            CliRequest::PrintHelp => panic!("name value {value:?} must not be intercepted as help"),
+            CliRequest::PrintVersion => {
+                panic!("name value {value:?} must not be intercepted as version")
+            }
+        };
+
+        assert_eq!(cli.name_override.as_deref(), Some(value));
+        assert!(matches!(
+            cli.run_target,
+            CliRunTarget::EphemeralArgv { ref argv }
+                if argv == &["echo".to_string(), "ok".to_string()]
+        ));
+    }
+}
+
+#[test]
+fn parse_rejects_name_override_with_control_character() {
+    let err = parse_cli_args_from(["givetray", "-c", "default", "--name", "Desk\nRig"])
+        .expect_err("name with control character must fail");
+
+    assert!(err.contains("control"));
 }
 
 #[test]
@@ -255,24 +238,196 @@ fn save_configuration_rejects_unparseable_command() {
 }
 
 #[test]
+fn parse_optional_display_name_treats_blank_as_none() {
+    let parsed = parse_optional_display_name("   \t").expect("blank display name should parse");
+    assert_eq!(parsed, None);
+}
+
+#[test]
+fn parse_optional_display_name_trims_non_blank_values() {
+    let parsed =
+        parse_optional_display_name("  Desk Rig  ").expect("display name should parse");
+    assert_eq!(parsed.as_deref(), Some("Desk Rig"));
+}
+
+#[test]
 fn save_configuration_returns_false_for_invalid_command() {
+    let err = build_saved_configuration(
+        "save-test",
+        None,
+        None,
+        "unterminated '",
+        "",
+        false,
+        false,
+    )
+    .expect_err("invalid command should reject save");
+
+    assert!(err.contains("invalid command:"));
+}
+
+#[test]
+fn save_configuration_heals_invalid_saved_names_before_persisting() {
     let _env_lock = ENV_LOCK.lock().expect("env lock should be acquired");
-    let temp_root = unique_test_dir("save-configuration-invalid-command");
+
+    for (saved_name, case_name) in [
+        ("   \t", "whitespace-only"),
+        ("Desk\nRig", "control-character"),
+        (&"x".repeat(MAX_DISPLAY_NAME_LENGTH + 1), "too-long"),
+    ] {
+        let temp_root = unique_test_dir(&format!("save-configuration-heal-name-{case_name}"));
+        fs::create_dir_all(&temp_root).expect("temp root should be created");
+        let _env = TestEnvGuard::set(&temp_root);
+
+        let config_path = temp_root.join("config").join(format!("{case_name}.toml"));
+        save_config(
+            &config_path,
+            &Config {
+                command: "echo ready".to_string(),
+                autostart: false,
+                name: Some(saved_name.to_string()),
+                icon_path: None,
+                log_to_file: false,
+                log_file_path: None,
+            },
+        )
+        .expect("baseline config should save");
+
+        let computed = build_saved_configuration(
+            "save-test",
+            None,
+            None,
+            "echo healed",
+            "",
+            false,
+            false,
+        )
+        .expect("save should compute for invalid stored-name healing");
+
+        save_config(&config_path, &computed.config).expect("healed config should save");
+
+        let loaded = load_or_create_config(&config_path);
+        assert_eq!(
+            loaded.name, None,
+            "persisted config should heal case: {case_name}"
+        );
+    }
+}
+
+#[test]
+fn save_configuration_updates_name_from_config_entry_without_touching_widgets() {
+    let _env_lock = ENV_LOCK.lock().expect("env lock should be acquired");
+    let temp_root = unique_test_dir("save-configuration-name-update");
     fs::create_dir_all(&temp_root).expect("temp root should be created");
     let _env = TestEnvGuard::set(&temp_root);
-    let state = build_save_test_state(&temp_root);
+    let config_path = temp_root.join("config").join("save-test.toml");
 
-    let saved = save_configuration(state.clone(), "unterminated '".to_string(), false);
-    assert!(!saved);
+    let computed = build_saved_configuration(
+        "save-test",
+        None,
+        None,
+        "echo renamed",
+        "  Office Box  ",
+        true,
+        false,
+    )
+    .expect("save should compute");
 
-    let state_ref = state.borrow();
-    let last_log = state_ref
-        .log_lines
-        .back()
-        .expect("save failure should append a log line");
-    assert!(last_log.contains("invalid command:"));
-    assert!(!last_log.contains("Invalid command: invalid command:"));
-    assert_eq!(state_ref.saved_command, "echo ready");
+    assert_eq!(computed.command, "echo renamed");
+    assert_eq!(computed.name.as_deref(), Some("Office Box"));
+    assert!(computed.autostart);
+
+    save_config(&config_path, &computed.config).expect("config should save");
+
+    let loaded = load_or_create_config(&config_path);
+    assert_eq!(loaded.name.as_deref(), Some("Office Box"));
+    assert_eq!(loaded.command, "echo renamed");
+    assert!(loaded.autostart);
+}
+
+#[test]
+fn save_configuration_clears_name_when_config_entry_is_blank() {
+    let _env_lock = ENV_LOCK.lock().expect("env lock should be acquired");
+    let temp_root = unique_test_dir("save-configuration-name-clear");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let computed = build_saved_configuration(
+        "save-test",
+        None,
+        None,
+        "echo renamed",
+        "   \t",
+        false,
+        false,
+    )
+    .expect("save should compute");
+    assert_eq!(computed.name, None);
+
+    let config_path = temp_root.join("config").join("save-test.toml");
+    save_config(&config_path, &computed.config).expect("config should save");
+
+    let loaded = load_or_create_config(&config_path);
+    assert_eq!(loaded.name, None);
+}
+
+#[test]
+fn save_config_round_trips_name_field() {
+    let temp_root = unique_test_dir("save-config-round-trip-name");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let config_path = temp_root.join("profile.toml");
+
+    save_config(
+        &config_path,
+        &Config {
+            command: "echo ready".to_string(),
+            autostart: false,
+            name: Some("Office Box".to_string()),
+            icon_path: None,
+            log_to_file: false,
+            log_file_path: None,
+        },
+    )
+    .expect("config should save");
+
+    let loaded = load_or_create_config(&config_path);
+    assert_eq!(loaded.name.as_deref(), Some("Office Box"));
+}
+
+#[test]
+fn config_dirty_status_marks_overlong_nonblank_name_as_unsaved() {
+    let overlong_name = "x".repeat(MAX_DISPLAY_NAME_LENGTH + 1);
+    assert!(name_field_has_unsaved_changes(&None, &overlong_name));
+}
+
+#[test]
+fn config_dirty_status_marks_control_char_nonblank_name_as_unsaved() {
+    assert!(name_field_has_unsaved_changes(&None, "Desk\nRig"));
+}
+
+#[test]
+fn config_dirty_status_marks_invalid_name_as_unsaved_when_saved_name_is_non_empty() {
+    let saved_name = Some("Office Box".to_string());
+    assert!(!name_field_has_unsaved_changes(&saved_name, "Office Box"));
+    assert!(name_field_has_unsaved_changes(&saved_name, "Office\nBox"));
+}
+
+#[test]
+fn apply_cli_overrides_keeps_existing_name_when_name_flag_is_absent() {
+    let mut config = Config {
+        command: "echo ready".to_string(),
+        autostart: false,
+        name: Some("Office Box".to_string()),
+        icon_path: None,
+        log_to_file: false,
+        log_file_path: None,
+    };
+    let cli = parse_cli_args_from(["givetray", "-c", "default"])
+        .expect("persistent profile mode should parse");
+
+    let changed = apply_cli_overrides_to_config(&mut config, &cli).expect("overrides should apply");
+    assert!(!changed);
+    assert_eq!(config.name.as_deref(), Some("Office Box"));
 }
 
 #[test]
@@ -385,6 +540,7 @@ fn build_detached_args_for_ephemeral_mode() {
             ],
         },
         command_override: None,
+        name_override: None,
         icon_source: None,
         log_file: None,
         mode: CliMode::Run,
@@ -402,12 +558,38 @@ fn build_detached_args_for_ephemeral_mode() {
 }
 
 #[test]
+fn build_detached_args_for_ephemeral_mode_preserves_name_override() {
+    let args = build_detached_args(&CliOptions {
+        run_target: CliRunTarget::EphemeralArgv {
+            argv: vec!["echo".to_string(), "hello".to_string()],
+        },
+        command_override: None,
+        name_override: Some("Demo Name".to_string()),
+        icon_source: None,
+        log_file: None,
+        mode: CliMode::Run,
+    });
+
+    assert_eq!(
+        args,
+        vec![
+            "--name".to_string(),
+            "Demo Name".to_string(),
+            "--".to_string(),
+            "echo".to_string(),
+            "hello".to_string(),
+        ]
+    );
+}
+
+#[test]
 fn build_detached_args_for_persistent_mode() {
     let args = build_detached_args(&CliOptions {
         run_target: CliRunTarget::PersistentProfile {
             profile: "default".to_string(),
         },
         command_override: None,
+        name_override: None,
         icon_source: None,
         log_file: None,
         mode: CliMode::Run,
@@ -423,6 +605,7 @@ fn build_detached_args_for_persistent_mode_preserves_overrides() {
             profile: "default".to_string(),
         },
         command_override: Some("echo detached run".to_string()),
+        name_override: None,
         icon_source: Some(PathBuf::from("/tmp/icon.png")),
         log_file: Some(PathBuf::from("/tmp/givetray.log")),
         mode: CliMode::Run,
@@ -439,6 +622,30 @@ fn build_detached_args_for_persistent_mode_preserves_overrides() {
             "/tmp/icon.png".to_string(),
             "--log-file".to_string(),
             "/tmp/givetray.log".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn build_detached_args_for_persistent_mode_preserves_name_override() {
+    let args = build_detached_args(&CliOptions {
+        run_target: CliRunTarget::PersistentProfile {
+            profile: "default".to_string(),
+        },
+        command_override: None,
+        name_override: Some("Desk Rig".to_string()),
+        icon_source: None,
+        log_file: None,
+        mode: CliMode::Run,
+    });
+
+    assert_eq!(
+        args,
+        vec![
+            "--config".to_string(),
+            "default".to_string(),
+            "--name".to_string(),
+            "Desk Rig".to_string(),
         ]
     );
 }
@@ -491,9 +698,27 @@ fn effective_command_token_supports_sudo_environment_assignment() {
 fn ephemeral_tooltip_uses_mode_label() {
     let tooltip = tray_tooltip(&CliRunTarget::EphemeralArgv {
         argv: vec!["echo".to_string(), "hello".to_string()],
-    });
+    }, None);
 
     assert_eq!(tooltip, "givetray (ephemeral)");
+}
+
+#[test]
+fn tray_tooltip_prefers_display_name_when_set() {
+    let tooltip = tray_tooltip(
+        &CliRunTarget::PersistentProfile {
+            profile: "default".to_string(),
+        },
+        Some("Office Box"),
+    );
+
+    assert_eq!(tooltip, "Office Box");
+}
+
+#[test]
+fn logs_window_title_uses_display_name_when_set() {
+    assert_eq!(logs_window_title(Some("Office Box")), "Logs (Office Box)");
+    assert_eq!(logs_window_title(None), "Logs");
 }
 
 #[test]
@@ -524,7 +749,7 @@ fn ephemeral_command_text_round_trips_backslashes() {
 
 #[test]
 fn ephemeral_runtime_config_defaults_are_non_persistent() {
-    let config = ephemeral_runtime_config(&["echo".to_string(), "hello world".to_string()]);
+    let config = ephemeral_runtime_config(&["echo".to_string(), "hello world".to_string()], None);
 
     assert_eq!(config.command, "echo 'hello world'");
     assert!(!config.autostart);
@@ -537,8 +762,9 @@ fn ephemeral_runtime_config_defaults_are_non_persistent() {
 fn ephemeral_mode_hides_configuration_menu() {
     let startup = StartupState {
         profile_label: "ephemeral".to_string(),
+        display_name: None,
         persistent_config_access: None,
-        config: ephemeral_runtime_config(&["echo".to_string()]),
+        config: ephemeral_runtime_config(&["echo".to_string()], None),
         log_file_path: None,
         launch_on_startup: true,
         runtime_state_path: None,
@@ -558,6 +784,7 @@ fn ephemeral_mode_hides_configuration_menu() {
 fn persistent_mode_exposes_configuration_menu() {
     let startup = StartupState {
         profile_label: "default".to_string(),
+        display_name: None,
         persistent_config_access: Some(PersistentConfigAccess {
             profile: "default".to_string(),
             config_path: PathBuf::from("/tmp/default.toml"),
@@ -565,6 +792,7 @@ fn persistent_mode_exposes_configuration_menu() {
         config: Config {
             command: DEFAULT_COMMAND.to_string(),
             autostart: false,
+            name: None,
             icon_path: None,
             log_to_file: false,
             log_file_path: None,
@@ -588,10 +816,12 @@ fn persistent_mode_exposes_configuration_menu() {
 fn startup_state_can_mark_profile_lock_conflict() {
     let startup = StartupState {
         profile_label: "default".to_string(),
+        display_name: None,
         persistent_config_access: None,
         config: Config {
             command: DEFAULT_COMMAND.to_string(),
             autostart: false,
+            name: None,
             icon_path: None,
             log_to_file: false,
             log_file_path: None,
@@ -703,6 +933,7 @@ fn ephemeral_startup_state_has_no_persistent_configuration_access() {
 fn persistent_startup_state_exposes_configuration_from_source_of_truth() {
     let startup = StartupState {
         profile_label: "default".to_string(),
+        display_name: None,
         persistent_config_access: Some(PersistentConfigAccess {
             profile: "default".to_string(),
             config_path: PathBuf::from("/tmp/default.toml"),
@@ -710,6 +941,7 @@ fn persistent_startup_state_exposes_configuration_from_source_of_truth() {
         config: Config {
             command: DEFAULT_COMMAND.to_string(),
             autostart: false,
+            name: None,
             icon_path: None,
             log_to_file: false,
             log_file_path: None,
@@ -758,6 +990,99 @@ fn startup_preflight_runs_after_detach_for_persistent_profiles() {
 }
 
 #[test]
+fn startup_state_display_name_prefers_cli_override() {
+    let _env_lock = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let temp_root = unique_test_dir("startup-display-name-cli-override");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let config_path = config_path_for_profile("default").expect("config path should resolve");
+    save_config(
+        &config_path,
+        &Config {
+            command: "echo ready".to_string(),
+            autostart: false,
+            name: Some("Config Name".to_string()),
+            icon_path: None,
+            log_to_file: false,
+            log_file_path: None,
+        },
+    )
+    .expect("config should save");
+
+    let cli = parse_cli_args_from(["givetray", "-c", "default", "--name", "CLI Name"])
+        .expect("cli should parse");
+    let startup = build_startup_state(&cli).expect("startup should build");
+
+    assert_eq!(startup.display_name.as_deref(), Some("CLI Name"));
+    assert_eq!(startup.config.name.as_deref(), Some("CLI Name"));
+}
+
+#[test]
+fn startup_state_display_name_uses_config_name_without_cli_override() {
+    let _env_lock = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let temp_root = unique_test_dir("startup-display-name-config");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let config_path = config_path_for_profile("default").expect("config path should resolve");
+    save_config(
+        &config_path,
+        &Config {
+            command: "echo ready".to_string(),
+            autostart: false,
+            name: Some("Config Name".to_string()),
+            icon_path: None,
+            log_to_file: false,
+            log_file_path: None,
+        },
+    )
+    .expect("config should save");
+
+    let cli = parse_cli_args_from(["givetray", "-c", "default"]).expect("cli should parse");
+    let startup = build_startup_state(&cli).expect("startup should build");
+
+    assert_eq!(startup.display_name.as_deref(), Some("Config Name"));
+    assert_eq!(startup.config.name.as_deref(), Some("Config Name"));
+}
+
+#[test]
+fn startup_state_ignores_invalid_config_display_names() {
+    let _env_lock = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+
+    for (config_name, case_name) in [
+        ("", "empty"),
+        ("   \t", "whitespace-only"),
+        ("Desk\nRig", "control-character"),
+    ] {
+        let temp_root = unique_test_dir(&format!("startup-display-name-config-invalid-{case_name}"));
+        fs::create_dir_all(&temp_root).expect("temp root should be created");
+        let _env = TestEnvGuard::set(&temp_root);
+
+        let config_path = config_path_for_profile("default").expect("config path should resolve");
+        save_config(
+            &config_path,
+            &Config {
+                command: "echo ready".to_string(),
+                autostart: false,
+                name: Some(config_name.to_string()),
+                icon_path: None,
+                log_to_file: false,
+                log_file_path: None,
+            },
+        )
+        .expect("config should save");
+
+        let cli = parse_cli_args_from(["givetray", "-c", "default"]).expect("cli should parse");
+        let startup = build_startup_state(&cli).expect("startup should build");
+
+        assert_eq!(startup.display_name, None, "case should be sanitized: {case_name}");
+        assert_eq!(tray_tooltip(&cli.run_target, startup.display_name.as_deref()), "givetray (default)");
+        assert_eq!(logs_window_title(startup.display_name.as_deref()), "Logs");
+    }
+}
+
+#[test]
 fn startup_preflight_does_not_persist_cli_overrides_without_profile_lock() {
     let _env_lock = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
     let temp_root = unique_test_dir("startup-preflight-lock-guard");
@@ -771,6 +1096,7 @@ fn startup_preflight_does_not_persist_cli_overrides_without_profile_lock() {
         &Config {
             command: "echo baseline".to_string(),
             autostart: false,
+            name: None,
             icon_path: None,
             log_to_file: false,
             log_file_path: None,
@@ -815,6 +1141,7 @@ fn desktop_file_creation_requires_profile_lock_before_persisting_overrides() {
         &Config {
             command: "echo baseline".to_string(),
             autostart: false,
+            name: None,
             icon_path: None,
             log_to_file: false,
             log_file_path: None,
@@ -1049,6 +1376,7 @@ fn malformed_runtime_state_file_gets_cleared_during_startup() {
         &Config {
             command: DEFAULT_COMMAND.to_string(),
             autostart: false,
+            name: None,
             icon_path: None,
             log_to_file: false,
             log_file_path: None,
@@ -1426,6 +1754,7 @@ fn process_exit_event_is_not_re_emitted_after_already_reported() {
 fn startup_runtime_state_no_state_stops() {
     let startup = StartupState {
         profile_label: "default".to_string(),
+        display_name: None,
         persistent_config_access: Some(PersistentConfigAccess {
             profile: "default".to_string(),
             config_path: PathBuf::from("/tmp/default.toml"),
@@ -1433,6 +1762,7 @@ fn startup_runtime_state_no_state_stops() {
         config: Config {
             command: "echo test".to_string(),
             autostart: false,
+            name: None,
             icon_path: None,
             log_to_file: false,
             log_file_path: None,
@@ -1465,6 +1795,7 @@ fn startup_runtime_state_recovered_running() {
 
     let startup = StartupState {
         profile_label: "default".to_string(),
+        display_name: None,
         persistent_config_access: Some(PersistentConfigAccess {
             profile: "default".to_string(),
             config_path: PathBuf::from("/tmp/default.toml"),
@@ -1472,6 +1803,7 @@ fn startup_runtime_state_recovered_running() {
         config: Config {
             command: "sleep 60".to_string(),
             autostart: false,
+            name: None,
             icon_path: None,
             log_to_file: false,
             log_file_path: None,
@@ -1505,6 +1837,7 @@ fn startup_runtime_state_stale_clears() {
 
     let startup = StartupState {
         profile_label: "default".to_string(),
+        display_name: None,
         persistent_config_access: Some(PersistentConfigAccess {
             profile: "default".to_string(),
             config_path: PathBuf::from("/tmp/default.toml"),
@@ -1512,6 +1845,7 @@ fn startup_runtime_state_stale_clears() {
         config: Config {
             command: "sleep 60".to_string(),
             autostart: false,
+            name: None,
             icon_path: None,
             log_to_file: false,
             log_file_path: None,
@@ -1555,6 +1889,7 @@ fn startup_reconcile_dead_runtime_state_gets_cleared() {
 
     let startup = StartupState {
         profile_label: "testprofile".to_string(),
+        display_name: None,
         persistent_config_access: Some(PersistentConfigAccess {
             profile: "testprofile".to_string(),
             config_path: PathBuf::from("/tmp/default.toml"),
@@ -1562,6 +1897,7 @@ fn startup_reconcile_dead_runtime_state_gets_cleared() {
         config: Config {
             command: "sleep 60".to_string(),
             autostart: false,
+            name: None,
             icon_path: None,
             log_to_file: false,
             log_file_path: None,
@@ -1614,6 +1950,7 @@ fn startup_reconcile_live_runtime_state_sets_restored_running() {
 
     let startup = StartupState {
         profile_label: "testprofile".to_string(),
+        display_name: None,
         persistent_config_access: Some(PersistentConfigAccess {
             profile: "testprofile".to_string(),
             config_path: PathBuf::from("/tmp/default.toml"),
@@ -1621,6 +1958,7 @@ fn startup_reconcile_live_runtime_state_sets_restored_running() {
         config: Config {
             command: "sleep 60".to_string(),
             autostart: false,
+            name: None,
             icon_path: None,
             log_to_file: false,
             log_file_path: None,
@@ -1665,6 +2003,7 @@ fn startup_reconcile_invalid_runtime_state_falls_back_to_stopped() {
 
     let startup = StartupState {
         profile_label: "testprofile".to_string(),
+        display_name: None,
         persistent_config_access: Some(PersistentConfigAccess {
             profile: "testprofile".to_string(),
             config_path: PathBuf::from("/tmp/default.toml"),
@@ -1672,6 +2011,7 @@ fn startup_reconcile_invalid_runtime_state_falls_back_to_stopped() {
         config: Config {
             command: "sleep 60".to_string(),
             autostart: false,
+            name: None,
             icon_path: None,
             log_to_file: false,
             log_file_path: None,
@@ -1730,10 +2070,12 @@ fn initial_start_stop_label_reflects_restored_state() {
 fn should_launch_on_startup_skips_relaunch_for_restored_run() {
     let startup = StartupState {
         profile_label: "default".to_string(),
+        display_name: None,
         persistent_config_access: None,
         config: Config {
             command: DEFAULT_COMMAND.to_string(),
             autostart: true,
+            name: None,
             icon_path: None,
             log_to_file: false,
             log_file_path: None,
@@ -1755,10 +2097,12 @@ fn should_launch_on_startup_skips_relaunch_for_restored_run() {
 fn should_launch_on_startup_runs_when_not_restored() {
     let startup = StartupState {
         profile_label: "default".to_string(),
+        display_name: None,
         persistent_config_access: None,
         config: Config {
             command: DEFAULT_COMMAND.to_string(),
             autostart: true,
+            name: None,
             icon_path: None,
             log_to_file: false,
             log_file_path: None,
@@ -1787,10 +2131,12 @@ fn startup_reconcile_sets_restored_message() {
 
     let startup = StartupState {
         profile_label: "default".to_string(),
+        display_name: None,
         persistent_config_access: None,
         config: Config {
             command: DEFAULT_COMMAND.to_string(),
             autostart: false,
+            name: None,
             icon_path: None,
             log_to_file: false,
             log_file_path: None,
