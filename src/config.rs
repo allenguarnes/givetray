@@ -10,8 +10,15 @@ use std::cell::RefCell;
 use std::fs;
 use std::io::Write;
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+
+#[cfg(unix)]
+const PRIVATE_DIR_MODE: u32 = 0o700;
+#[cfg(unix)]
+const PRIVATE_FILE_MODE: u32 = 0o600;
 
 pub(crate) struct ProfileLockHandle {
     // Keep the descriptor open so the advisory flock remains held.
@@ -94,17 +101,31 @@ pub(crate) fn save_config(path: &Path, config: &Config) -> Result<(), String> {
 }
 
 pub(crate) fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
+    atomic_write_private(path, contents)
+}
+
+pub(crate) fn atomic_write_private(path: &Path, contents: &str) -> Result<(), String> {
+    atomic_write_with(path, contents, ensure_private_directory, create_private_file)
+}
+
+pub(crate) fn atomic_write_shared(path: &Path, contents: &str) -> Result<(), String> {
+    atomic_write_with(path, contents, ensure_directory, create_shared_file)
+}
+
+fn atomic_write_with(
+    path: &Path,
+    contents: &str,
+    ensure_parent: fn(&Path) -> Result<(), String>,
+    create_temp_file: fn(&Path) -> Result<fs::File, std::io::Error>,
+) -> Result<(), String> {
     let Some(parent) = path.parent() else {
         return Err("file has no parent directory".to_string());
     };
 
-    fs::create_dir_all(parent).map_err(|err| format!("failed to create directory: {err}"))?;
+    ensure_parent(parent)?;
     // Durability note: we sync only `parent` after rename. If create_dir_all had to
     // create missing ancestors on first run, those ancestor directory entries may not
     // be individually synced to their own parents before a crash.
-    let existing_permissions = path.metadata().ok().map(|metadata| metadata.permissions());
-    // Permission note: this preserves standard file permission bits via
-    // std::fs::Permissions, but not ownership, ACLs, or xattrs.
 
     let file_name = path
         .file_name()
@@ -117,12 +138,8 @@ pub(crate) fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
     let temp_path = parent.join(format!(".tmp.{file_name}.{}.{}", std::process::id(), nonce));
 
     let write_result = (|| {
-        let mut file = fs::File::create(&temp_path)
+        let mut file = create_temp_file(&temp_path)
             .map_err(|err| format!("failed to create temp file: {err}"))?;
-        if let Some(permissions) = existing_permissions.as_ref() {
-            file.set_permissions(permissions.clone())
-                .map_err(|err| format!("failed to set temp file permissions: {err}"))?;
-        }
         file.write_all(contents.as_bytes())
             .map_err(|err| format!("failed to write temp file: {err}"))?;
         file.sync_all()
@@ -142,12 +159,76 @@ pub(crate) fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
     sync_directory(parent)
 }
 
+pub(crate) fn ensure_directory(path: &Path) -> Result<(), String> {
+    fs::create_dir_all(path).map_err(|err| format!("failed to create directory: {err}"))
+}
+
 fn sync_directory(path: &Path) -> Result<(), String> {
     let directory =
         fs::File::open(path).map_err(|err| format!("failed to open directory for sync: {err}"))?;
     directory
         .sync_all()
         .map_err(|err| format!("failed to sync directory: {err}"))
+}
+
+pub(crate) fn ensure_private_directory(path: &Path) -> Result<(), String> {
+    ensure_directory(path)?;
+    set_private_directory_permissions(path)
+        .map_err(|err| format!("failed to secure directory permissions: {err}"))
+}
+
+pub(crate) fn ensure_private_directory_if_missing(path: &Path) -> Result<(), String> {
+    if path.exists() {
+        return Ok(());
+    }
+
+    ensure_private_directory(path)
+}
+
+pub(crate) fn create_private_file(path: &Path) -> Result<fs::File, std::io::Error> {
+    #[cfg(unix)]
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(PRIVATE_FILE_MODE)
+        .open(path)?;
+
+    #[cfg(not(unix))]
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+
+    set_private_file_permissions(&file)?;
+    Ok(file)
+}
+
+pub(crate) fn create_shared_file(path: &Path) -> Result<fs::File, std::io::Error> {
+    fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+}
+
+pub(crate) fn set_private_file_permissions(file: &fs::File) -> Result<(), std::io::Error> {
+    #[cfg(unix)]
+    {
+        file.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
+    }
+
+    Ok(())
+}
+
+fn set_private_directory_permissions(path: &Path) -> Result<(), std::io::Error> {
+    #[cfg(unix)]
+    {
+        fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_DIR_MODE))?;
+    }
+
+    Ok(())
 }
 
 pub(crate) fn sanitize_profile_name(profile: &str) -> String {
@@ -439,9 +520,21 @@ pub(crate) fn profile_lock_path_for_profile(profile: &str) -> Option<PathBuf> {
 
 pub(crate) fn acquire_profile_lock(path: &Path) -> Result<ProfileLockHandle, String> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| format!("failed to create lock dir: {err}"))?;
+        ensure_private_directory(parent)
+            .map_err(|err| format!("failed to create lock dir: {err}"))?;
     }
 
+    #[cfg(unix)]
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .mode(PRIVATE_FILE_MODE)
+        .open(path)
+        .map_err(|err| format!("failed to open profile lock file: {err}"))?;
+
+    #[cfg(not(unix))]
     let file = fs::OpenOptions::new()
         .create(true)
         .read(true)
@@ -449,6 +542,9 @@ pub(crate) fn acquire_profile_lock(path: &Path) -> Result<ProfileLockHandle, Str
         .truncate(false)
         .open(path)
         .map_err(|err| format!("failed to open profile lock file: {err}"))?;
+
+    set_private_file_permissions(&file)
+        .map_err(|err| format!("failed to secure profile lock file: {err}"))?;
 
     let status = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if status != 0 {

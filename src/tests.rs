@@ -6,40 +6,41 @@ use crate::cli::{
 };
 use crate::config::config_path_for_profile;
 use crate::config::{
-    acquire_profile_lock, apply_cli_overrides_to_config, atomic_write, build_saved_configuration,
-    can_save_profile_configuration, clear_runtime_state, load_or_create_config, load_runtime_state,
-    parse_optional_display_name, profile_lock_path_for_profile, reconcile_startup_runtime_state,
-    runtime_state_path_for_ephemeral, runtime_state_path_for_profile, save_config,
-    save_runtime_state, validate_saved_command_text,
+    acquire_profile_lock, apply_cli_overrides_to_config, atomic_write, atomic_write_shared,
+    build_saved_configuration, can_save_profile_configuration, clear_runtime_state,
+    load_or_create_config, load_runtime_state, parse_optional_display_name,
+    profile_lock_path_for_profile, reconcile_startup_runtime_state, runtime_state_path_for_ephemeral,
+    runtime_state_path_for_profile, save_config, save_runtime_state, validate_saved_command_text,
 };
 use crate::desktop::{
-    app_id_for_profile, applications_entry_is_visible, create_desktop_file_from_cli, desktop_entry,
-    desktop_entry_is_visible, desktop_file_name, ensure_hidden_identity_desktop_file,
-    rgba_to_argb_in_place,
+    app_id_for_profile, applications_entry_is_visible, copy_icon_to_profile,
+    create_desktop_file_from_cli, desktop_entry, desktop_entry_is_visible, desktop_file_name,
+    ensure_hidden_identity_desktop_file, resolve_tray_icon, rgba_to_argb_in_place,
 };
 #[cfg(target_os = "linux")]
 use crate::desktop::{resolved_tray_icon_to_sni_pixmap, ResolvedTrayIcon};
 use crate::logs::{
     append_log_to_file, clear_runtime_state_after_exit, extract_log_links, logs_window_title,
-    should_activate_log_link, strip_ansi_codes,
+    should_activate_log_link, strip_ansi_codes, truncate_log_line,
 };
-use crate::process::can_control_profile;
-use crate::process::is_process_group_alive;
-use crate::process::reconcile_runtime_state;
-use crate::process::RuntimeReconcileResult;
+use crate::process::{
+    can_control_profile, is_process_group_alive, read_bounded_line, reconcile_runtime_state,
+    RuntimeReconcileResult,
+};
 #[cfg(target_os = "linux")]
 use crate::tray::{
     sni_escape_menu_label, sni_id_for_run_target, sni_mode_text, sni_tooltip_description,
-    SNI_MENU_ON_ACTIVATE,
 };
 use crate::tray::{
     action_from_menu_id, drain_tray_actions, enqueue_tray_action_for_test,
-    tray_menu_overview_label, TrayAction,
+    tray_action_queue_capacity_for_test, tray_menu_overview_label, TrayAction,
 };
 use crate::ui::name_field_has_unsaved_changes;
 use crate::*;
+use image::{codecs::png::PngEncoder, ColorType, ImageEncoder, RgbaImage};
 use std::env;
 use std::fs;
+use std::io::Cursor;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -782,6 +783,22 @@ fn tray_action_queue_is_empty_after_drain() {
 }
 
 #[test]
+fn tray_action_queue_drops_oldest_when_full() {
+    let _queue_lock = ENV_LOCK.lock().expect("env lock should be acquired");
+    let _ = drain_tray_actions();
+
+    let capacity = tray_action_queue_capacity_for_test();
+    for _ in 0..capacity {
+        enqueue_tray_action_for_test(TrayAction::ShowLogs);
+    }
+    enqueue_tray_action_for_test(TrayAction::Exit);
+
+    let drained = drain_tray_actions();
+    assert_eq!(drained.len(), capacity);
+    assert_eq!(drained.last(), Some(&TrayAction::Exit));
+}
+
+#[test]
 fn rgba_to_argb_conversion_rotates_channels_per_pixel() {
     let mut rgba = vec![10, 20, 30, 40, 100, 110, 120, 130];
     rgba_to_argb_in_place(&mut rgba);
@@ -899,12 +916,6 @@ fn sni_menu_label_escapes_underscores() {
         sni_escape_menu_label("name_with_underscores"),
         "name__with__underscores"
     );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn sni_left_click_opens_menu() {
-    assert!(SNI_MENU_ON_ACTIVATE);
 }
 
 #[test]
@@ -1433,6 +1444,77 @@ fn desktop_file_creation_requires_profile_lock_before_persisting_overrides() {
     assert!(!saved.contains("printf changed"));
 }
 
+#[cfg(unix)]
+#[test]
+fn desktop_file_output_dir_does_not_chmod_existing_directory() {
+    let _env_lock = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let temp_root = unique_test_dir("desktop-file-output-dir-perms");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let output_dir = temp_root.join("desktop-output");
+    fs::create_dir_all(&output_dir).expect("output dir should be created");
+
+    let original_mode = 0o755;
+    fs::set_permissions(&output_dir, fs::Permissions::from_mode(original_mode))
+        .expect("output dir mode should be set");
+
+    let cli = parse_cli_args_from(["givetray", "desktop-file", "-c", "secure-profile"])
+        .expect("desktop-file cli should parse");
+
+    create_desktop_file_from_cli(&cli, Some(output_dir.clone()), false)
+        .expect("desktop file should be created");
+
+    let mode_after = fs::metadata(&output_dir)
+        .expect("output dir metadata should be readable")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode_after, original_mode);
+}
+
+#[cfg(unix)]
+#[test]
+fn desktop_file_output_uses_shared_default_file_mode() {
+    let _env_lock = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let temp_root = unique_test_dir("desktop-file-shared-mode");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let output_dir = temp_root.join("desktop-output");
+    fs::create_dir_all(&output_dir).expect("output dir should be created");
+
+    let baseline_path = output_dir.join("baseline.desktop");
+    fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&baseline_path)
+        .expect("baseline desktop file should be created");
+    let expected_mode = fs::metadata(&baseline_path)
+        .expect("baseline metadata should be readable")
+        .permissions()
+        .mode()
+        & 0o777;
+    fs::remove_file(&baseline_path).expect("baseline desktop file should be removed");
+
+    let profile = "shared-mode";
+    let cli = parse_cli_args_from(["givetray", "desktop-file", "-c", profile])
+        .expect("desktop-file cli should parse");
+
+    create_desktop_file_from_cli(&cli, Some(output_dir.clone()), false)
+        .expect("desktop file should be created");
+
+    let desktop_path = output_dir.join(desktop_file_name(profile));
+    let actual_mode = fs::metadata(&desktop_path)
+        .expect("desktop file metadata should be readable")
+        .permissions()
+        .mode()
+        & 0o777;
+
+    assert_eq!(actual_mode, expected_mode);
+}
+
 #[test]
 fn app_id_matches_desktop_filename_stem() {
     let profile = "default";
@@ -1459,7 +1541,8 @@ fn desktop_entry_includes_startup_wm_class() {
         "default",
         false,
         false,
-    );
+    )
+    .expect("desktop entry should build");
 
     assert!(entry.contains("StartupWMClass=givetray_default\n"));
     assert!(!entry.contains("NoDisplay=true\n"));
@@ -1473,7 +1556,8 @@ fn hidden_identity_desktop_entry_sets_no_display() {
         "default",
         false,
         true,
-    );
+    )
+    .expect("desktop entry should build");
 
     assert!(entry.contains("StartupWMClass=givetray_default\n"));
     assert!(entry.contains("NoDisplay=true\n"));
@@ -1487,14 +1571,16 @@ fn desktop_entry_is_visible_detects_hidden_marker() {
         "default",
         false,
         false,
-    );
+    )
+    .expect("visible desktop entry should build");
     let hidden_entry = desktop_entry(
         Path::new("/usr/bin/givetray"),
         Path::new("/tmp/icon.png"),
         "default",
         false,
         true,
-    );
+    )
+    .expect("hidden desktop entry should build");
 
     assert!(desktop_entry_is_visible(&visible_entry));
     assert!(!desktop_entry_is_visible(&hidden_entry));
@@ -1520,7 +1606,8 @@ fn applications_entry_visibility_reads_no_display_from_file() {
         profile,
         false,
         false,
-    );
+    )
+    .expect("visible desktop entry should build");
     atomic_write(&path, &visible_entry).expect("visible desktop entry should write");
     assert!(applications_entry_is_visible(profile));
 
@@ -1530,7 +1617,8 @@ fn applications_entry_visibility_reads_no_display_from_file() {
         profile,
         false,
         true,
-    );
+    )
+    .expect("hidden desktop entry should build");
     atomic_write(&path, &hidden_entry).expect("hidden desktop entry should write");
     assert!(!applications_entry_is_visible(profile));
 }
@@ -1590,7 +1678,8 @@ fn ensure_hidden_identity_desktop_file_preserves_visible_entry_visibility() {
         profile,
         false,
         false,
-    );
+    )
+    .expect("visible desktop entry should build");
     atomic_write(&path, &visible_entry).expect("visible desktop entry should write");
 
     ensure_hidden_identity_desktop_file(profile, &config)
@@ -1728,6 +1817,32 @@ fn append_log_to_file_reuses_writer_across_calls() {
         .expect("log file should be readable");
 
     assert_eq!(contents, "first line\nsecond line\n");
+}
+
+#[test]
+fn truncate_log_line_marks_oversized_messages() {
+    let truncated = truncate_log_line(&"x".repeat(20_000));
+
+    assert!(truncated.len() < 20_000);
+    assert!(truncated.contains("[truncated]"));
+}
+
+#[test]
+fn read_bounded_line_truncates_oversized_child_output() {
+    let oversized = format!("{}\nnext\n", "a".repeat(20_000));
+    let mut cursor = Cursor::new(oversized.into_bytes());
+
+    let first = read_bounded_line(&mut cursor, 1024)
+        .expect("reader should succeed")
+        .expect("first line should exist");
+    let second = read_bounded_line(&mut cursor, 1024)
+        .expect("reader should succeed")
+        .expect("second line should exist");
+
+    assert!(first.truncated);
+    assert!(first.text.contains("[truncated child output]"));
+    assert_eq!(second.text, "next");
+    assert!(!second.truncated);
 }
 
 #[test]
@@ -2039,6 +2154,266 @@ fn atomic_write_preserves_existing_file_permissions() {
         .mode()
         & 0o777;
     assert_eq!(mode_after, secure_mode);
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_write_shared_does_not_chmod_existing_parent_directory() {
+    let temp_dir = unique_test_dir("atomic-write-shared-parent");
+    fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+    let parent = temp_dir.join("desktop");
+    fs::create_dir_all(&parent).expect("parent should be created");
+    let original_mode = 0o755;
+    fs::set_permissions(&parent, fs::Permissions::from_mode(original_mode))
+        .expect("parent mode should be set");
+
+    let file_path = parent.join("entry.desktop");
+    atomic_write_shared(&file_path, "[Desktop Entry]\nType=Application\n")
+        .expect("shared atomic write should succeed");
+
+    let parent_mode = fs::metadata(&parent)
+        .expect("parent metadata should be readable")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(parent_mode, original_mode);
+}
+
+#[cfg(unix)]
+#[test]
+fn save_config_creates_private_file_and_directory_permissions() {
+    let _env_lock = ENV_LOCK.lock().expect("env lock should be acquired");
+    let temp_root = unique_test_dir("config-private-permissions");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let config_path = config_path_for_profile("secure").expect("config path should resolve");
+    save_config(
+        &config_path,
+        &Config {
+            command: "echo secure".to_string(),
+            autostart: false,
+            name: None,
+            icon_path: None,
+            log_to_file: false,
+            log_file_path: None,
+        },
+    )
+    .expect("config should save");
+
+    let parent_mode = fs::metadata(config_path.parent().expect("config parent should exist"))
+        .expect("config parent metadata should be readable")
+        .permissions()
+        .mode()
+        & 0o777;
+    let file_mode = fs::metadata(&config_path)
+        .expect("config metadata should be readable")
+        .permissions()
+        .mode()
+        & 0o777;
+
+    assert_eq!(parent_mode, 0o700);
+    assert_eq!(file_mode, 0o600);
+}
+
+#[cfg(unix)]
+#[test]
+fn save_runtime_state_creates_private_file_and_directory_permissions() {
+    let _env_lock = ENV_LOCK.lock().expect("env lock should be acquired");
+    let temp_root = unique_test_dir("runtime-private-permissions");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let runtime_path =
+        runtime_state_path_for_profile("secure").expect("runtime path should resolve");
+    save_runtime_state(
+        &runtime_path,
+        &RuntimeOwnershipState {
+            pid: 42,
+            pgid: 42,
+            started_at_clock_ticks: 123,
+            command_label: "echo secure".to_string(),
+            profile_name: Some("secure".to_string()),
+            ephemeral: false,
+        },
+    )
+    .expect("runtime state should save");
+
+    let parent_mode = fs::metadata(runtime_path.parent().expect("runtime parent should exist"))
+        .expect("runtime parent metadata should be readable")
+        .permissions()
+        .mode()
+        & 0o777;
+    let file_mode = fs::metadata(&runtime_path)
+        .expect("runtime metadata should be readable")
+        .permissions()
+        .mode()
+        & 0o777;
+
+    assert_eq!(parent_mode, 0o700);
+    assert_eq!(file_mode, 0o600);
+}
+
+#[cfg(unix)]
+#[test]
+fn append_log_to_file_creates_private_file_and_directory_permissions() {
+    let temp_root = unique_test_dir("log-private-permissions");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let log_path = temp_root.join("logs").join("givetray.log");
+    let mut writer = None;
+
+    append_log_to_file(&mut writer, &log_path, "secure line").expect("log write should succeed");
+    drop(writer);
+
+    let parent_mode = fs::metadata(log_path.parent().expect("log parent should exist"))
+        .expect("log parent metadata should be readable")
+        .permissions()
+        .mode()
+        & 0o777;
+    let file_mode = fs::metadata(&log_path)
+        .expect("log metadata should be readable")
+        .permissions()
+        .mode()
+        & 0o777;
+
+    assert_eq!(parent_mode, 0o700);
+    assert_eq!(file_mode, 0o600);
+}
+
+#[cfg(unix)]
+#[test]
+fn append_log_to_file_preserves_existing_parent_directory_permissions() {
+    let temp_root = unique_test_dir("log-existing-parent-permissions");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let log_dir = temp_root.join("logs");
+    fs::create_dir_all(&log_dir).expect("log dir should be created");
+    let original_mode = 0o755;
+    fs::set_permissions(&log_dir, fs::Permissions::from_mode(original_mode))
+        .expect("log dir mode should be set");
+
+    let log_path = log_dir.join("givetray.log");
+    let mut writer = None;
+    append_log_to_file(&mut writer, &log_path, "line").expect("log write should succeed");
+    drop(writer);
+
+    let mode_after = fs::metadata(&log_dir)
+        .expect("log dir metadata should be readable")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode_after, original_mode);
+}
+
+#[cfg(unix)]
+#[test]
+fn append_log_to_file_preserves_existing_file_permissions() {
+    let temp_root = unique_test_dir("log-existing-file-permissions");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let log_dir = temp_root.join("logs");
+    fs::create_dir_all(&log_dir).expect("log dir should be created");
+    let log_path = log_dir.join("givetray.log");
+
+    fs::write(&log_path, "existing\n").expect("existing log file should be created");
+    let original_mode = 0o644;
+    fs::set_permissions(&log_path, fs::Permissions::from_mode(original_mode))
+        .expect("existing log mode should be set");
+
+    let mut writer = None;
+    append_log_to_file(&mut writer, &log_path, "new line").expect("log append should succeed");
+    drop(writer);
+
+    let mode_after = fs::metadata(&log_path)
+        .expect("log file metadata should be readable")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode_after, original_mode);
+}
+
+#[cfg(unix)]
+#[test]
+fn acquire_profile_lock_creates_private_lock_permissions() {
+    let _env_lock = ENV_LOCK.lock().expect("env lock should be acquired");
+    let temp_root = unique_test_dir("lock-private-permissions");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let lock_path = profile_lock_path_for_profile("secure").expect("lock path should resolve");
+    let _lock = acquire_profile_lock(&lock_path).expect("profile lock should succeed");
+
+    let parent_mode = fs::metadata(lock_path.parent().expect("lock parent should exist"))
+        .expect("lock parent metadata should be readable")
+        .permissions()
+        .mode()
+        & 0o777;
+    let file_mode = fs::metadata(&lock_path)
+        .expect("lock metadata should be readable")
+        .permissions()
+        .mode()
+        & 0o777;
+
+    assert_eq!(parent_mode, 0o700);
+    assert_eq!(file_mode, 0o600);
+}
+
+#[test]
+fn desktop_entry_rejects_newline_in_icon_path() {
+    let err = desktop_entry(
+        Path::new("/usr/bin/givetray"),
+        Path::new("/tmp/icon\nmalicious.png"),
+        "default",
+        false,
+        false,
+    )
+    .expect_err("desktop entry should reject control characters");
+
+    assert!(err.contains("Icon"));
+}
+
+fn write_png_icon(path: &Path, width: u32, height: u32) {
+    let image = RgbaImage::from_pixel(width, height, image::Rgba([1, 2, 3, 255]));
+    let file = fs::File::create(path).expect("icon file should be created");
+    let encoder = PngEncoder::new(file);
+    encoder
+        .write_image(image.as_raw(), width, height, ColorType::Rgba8.into())
+        .expect("png icon should encode");
+}
+
+#[test]
+fn copy_icon_to_profile_rejects_oversized_dimensions() {
+    let _env_lock = ENV_LOCK.lock().expect("env lock should be acquired");
+    let temp_root = unique_test_dir("oversized-profile-icon");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+    let _env = TestEnvGuard::set(&temp_root);
+
+    let source_path = temp_root.join("oversized.png");
+    write_png_icon(&source_path, 1025, 1024);
+
+    let err = copy_icon_to_profile(&source_path, "default")
+        .expect_err("oversized icon should be rejected");
+    assert!(err.contains("exceed maximum"));
+}
+
+#[test]
+fn resolve_tray_icon_falls_back_when_custom_icon_is_oversized() {
+    let temp_root = unique_test_dir("oversized-tray-icon-fallback");
+    fs::create_dir_all(&temp_root).expect("temp root should be created");
+
+    let source_path = temp_root.join("oversized.png");
+    write_png_icon(&source_path, 1025, 1024);
+
+    let icon = resolve_tray_icon(&Config {
+        command: "echo ready".to_string(),
+        autostart: false,
+        name: None,
+        icon_path: Some(source_path.to_string_lossy().to_string()),
+        log_to_file: false,
+        log_file_path: None,
+    })
+    .expect("tray icon should fall back to bundled icon");
+
+    assert!(icon.width <= 1024);
+    assert!(icon.height <= 1024);
 }
 
 #[test]

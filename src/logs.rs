@@ -1,7 +1,10 @@
 use crate::process::{start_command, stop_command};
 use crate::{
-    config::clear_runtime_state, AppState, LogLink, PendingLogLink, UiEvent, LOG_LINK_CLICK_SLOP,
-    LOG_LINK_TAG_NAME, MAX_LOG_LINES,
+    config::{
+        clear_runtime_state, ensure_private_directory_if_missing, set_private_file_permissions,
+    },
+    AppState, LogLink, PendingLogLink, UiEvent, LOG_LINK_CLICK_SLOP, LOG_LINK_TAG_NAME,
+    MAX_LOG_LINES,
 };
 use async_channel::{Receiver, Sender};
 use glib::{ControlFlow, MainContext, Propagation};
@@ -13,8 +16,13 @@ use gtk::gdk;
 use gtk::prelude::*;
 use std::fs::{self, File};
 use std::io::{LineWriter, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::{cell::RefCell, rc::Rc};
+
+const MAX_LOG_LINE_CHARS: usize = 16 * 1024;
+const LOG_LINE_TRUNCATION_SUFFIX: &str = " … [truncated]";
 
 pub(crate) const PROFILE_LOCK_ACTION_BLOCKED_MESSAGE: &str =
     "profile already open in another session; start/stop and configuration save are disabled";
@@ -648,13 +656,28 @@ fn set_logs_link_cursor(text_view: &gtk::TextView, active: bool) {
 
 fn open_log_file_writer(path: &Path) -> Result<LineWriter<File>, std::io::Error> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        ensure_private_directory_if_missing(parent)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::PermissionDenied, err))?;
     }
 
+    let existed_before = path.exists();
+
+    #[cfg(unix)]
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)?;
+
+    #[cfg(not(unix))]
     let file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)?;
+
+    if !existed_before {
+        set_private_file_permissions(&file)?;
+    }
     Ok(LineWriter::new(file))
 }
 
@@ -746,8 +769,21 @@ pub(crate) fn strip_ansi_codes(line: &str) -> String {
     result
 }
 
+pub(crate) fn truncate_log_line(line: &str) -> String {
+    let mut chars = line.chars();
+    let truncated: String = chars.by_ref().take(MAX_LOG_LINE_CHARS).collect();
+    if chars.next().is_none() {
+        return line.to_string();
+    }
+
+    let keep = MAX_LOG_LINE_CHARS.saturating_sub(LOG_LINE_TRUNCATION_SUFFIX.chars().count());
+    let mut shortened = truncated.chars().take(keep).collect::<String>();
+    shortened.push_str(LOG_LINE_TRUNCATION_SUFFIX);
+    shortened
+}
+
 pub(crate) fn append_log(state: &mut AppState, line: String) {
-    let clean_line = strip_ansi_codes(&line);
+    let clean_line = truncate_log_line(&strip_ansi_codes(&line));
     let links = extract_log_links(&clean_line);
     if state.log_lines.len() >= MAX_LOG_LINES {
         state.log_lines.pop_front();

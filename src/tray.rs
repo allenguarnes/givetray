@@ -1,7 +1,8 @@
 use crate::CliRunTarget;
-use async_channel::{Receiver, Sender};
+use async_channel::{Receiver, Sender, TrySendError};
 use std::cell::{Cell, RefCell};
-use std::sync::OnceLock;
+use std::sync::{mpsc, OnceLock};
+use std::time::Duration;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
@@ -14,6 +15,10 @@ use ksni::blocking::TrayMethods;
 
 #[cfg(target_os = "linux")]
 pub(crate) const SNI_MENU_ON_ACTIVATE: bool = true;
+
+const TRAY_ACTION_QUEUE_CAPACITY: usize = 64;
+#[cfg(target_os = "linux")]
+const SNI_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 
 const NAME_ID: &str = "name";
 const START_STOP_ID: &str = "start-stop";
@@ -34,17 +39,28 @@ pub(crate) enum TrayAction {
 static TRAY_ACTION_CHANNEL: OnceLock<(Sender<TrayAction>, Receiver<TrayAction>)> = OnceLock::new();
 
 fn tray_action_channel() -> &'static (Sender<TrayAction>, Receiver<TrayAction>) {
-    TRAY_ACTION_CHANNEL.get_or_init(async_channel::unbounded)
+    TRAY_ACTION_CHANNEL.get_or_init(|| async_channel::bounded(TRAY_ACTION_QUEUE_CAPACITY))
 }
 
 fn enqueue_tray_action(action: TrayAction) {
-    let (tx, _rx) = tray_action_channel();
-    let _ = tx.try_send(action);
+    let (tx, rx) = tray_action_channel();
+    match tx.try_send(action) {
+        Ok(()) | Err(TrySendError::Closed(_)) => {}
+        Err(TrySendError::Full(action)) => {
+            let _ = rx.try_recv();
+            let _ = tx.try_send(action);
+        }
+    }
 }
 
 #[cfg(test)]
 pub(crate) fn enqueue_tray_action_for_test(action: TrayAction) {
     enqueue_tray_action(action);
+}
+
+#[cfg(test)]
+pub(crate) fn tray_action_queue_capacity_for_test() -> usize {
+    TRAY_ACTION_QUEUE_CAPACITY
 }
 
 pub(crate) fn action_from_menu_id(id: &str) -> Option<TrayAction> {
@@ -124,7 +140,7 @@ impl TrayIconHandle {
     fn set_display(&self, text: &str) {
         self.display_title.replace(text.to_string());
         self.name_item
-            .set_text(&tray_menu_overview_label(text, &self.mode, self.running.get()));
+            .set_text(tray_menu_overview_label(text, &self.mode, self.running.get()));
         if let Err(err) = self.tray_icon.set_tooltip(Some(text)) {
             eprintln!("failed to update tray tooltip: {err}");
         }
@@ -134,7 +150,7 @@ impl TrayIconHandle {
 
     fn set_running(&self, running: bool) {
         self.running.set(running);
-        self.name_item.set_text(&tray_menu_overview_label(
+        self.name_item.set_text(tray_menu_overview_label(
             &self.display_title.borrow(),
             &self.mode,
             running,
@@ -279,7 +295,16 @@ impl SniHandle {
 #[cfg(target_os = "linux")]
 impl Drop for SniHandle {
     fn drop(&mut self) {
-        self.handle.shutdown().wait();
+        let awaiter = self.handle.shutdown();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            awaiter.wait();
+            let _ = tx.send(());
+        });
+
+        if rx.recv_timeout(SNI_SHUTDOWN_TIMEOUT).is_err() {
+            eprintln!("timed out waiting for SNI tray shutdown");
+        }
     }
 }
 

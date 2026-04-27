@@ -1,18 +1,25 @@
 use crate::config::{
-    acquire_profile_lock, apply_cli_overrides_to_config, atomic_write, config_path_for_profile,
-    load_or_create_config, profile_lock_path_for_profile, sanitize_profile_name, save_config,
+    acquire_profile_lock, apply_cli_overrides_to_config, atomic_write_shared, config_path_for_profile,
+    create_private_file, ensure_private_directory, load_or_create_config,
+    profile_lock_path_for_profile, sanitize_profile_name, save_config,
 };
 use crate::logs::append_log;
 use crate::{AppState, CliOptions, Config, APP_NAME, BUNDLED_ICON_FILE_NAME, ICON_FILE_NAME};
 use directories::{BaseDirs, ProjectDirs};
-use gtk::gdk_pixbuf::Pixbuf;
-use image::RgbaImage;
+use gtk::gdk_pixbuf::{Pixbuf, PixbufLoader};
+use gtk::prelude::PixbufLoaderExt;
+use image::{ImageReader, RgbaImage};
 use std::cell::RefCell;
 use std::env;
 use std::fs;
+use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use tray_icon::Icon;
+
+const MAX_ICON_FILE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_ICON_DIMENSION: u32 = 1024;
+const MAX_ICON_PIXELS: u64 = (MAX_ICON_DIMENSION as u64) * (MAX_ICON_DIMENSION as u64);
 
 pub(crate) fn create_desktop_file_from_cli(
     cli: &CliOptions,
@@ -52,7 +59,7 @@ pub(crate) fn create_desktop_file_from_cli(
             .ok_or_else(|| "unable to resolve Applications desktop path".to_string())?
     };
 
-    let contents = desktop_entry(&exec_path, &icon_path, profile, autostart, false);
+    let contents = desktop_entry(&exec_path, &icon_path, profile, autostart, false)?;
     write_desktop_file(&desktop_path, &contents)
         .map_err(|err| format!("failed to write desktop file: {err}"))?;
 
@@ -109,7 +116,17 @@ pub(crate) fn apply_desktop_actions(
 
     if let Some(path) = applications_desktop_path(&access.profile) {
         if apps_enabled {
-            let content = desktop_entry(&exec_path, &icon_path, &access.profile, false, false);
+            let content = match desktop_entry(&exec_path, &icon_path, &access.profile, false, false)
+            {
+                Ok(content) => content,
+                Err(err) => {
+                    append_log(
+                        &mut state.borrow_mut(),
+                        format!("Failed to build Applications entry: {err}"),
+                    );
+                    return;
+                }
+            };
             if let Err(err) = write_desktop_file(&path, &content) {
                 append_log(
                     &mut state.borrow_mut(),
@@ -122,7 +139,17 @@ pub(crate) fn apply_desktop_actions(
                 );
             }
         } else {
-            let content = desktop_entry(&exec_path, &icon_path, &access.profile, false, true);
+            let content = match desktop_entry(&exec_path, &icon_path, &access.profile, false, true)
+            {
+                Ok(content) => content,
+                Err(err) => {
+                    append_log(
+                        &mut state.borrow_mut(),
+                        format!("Failed to build Applications entry: {err}"),
+                    );
+                    return;
+                }
+            };
             if let Err(err) = write_desktop_file(&path, &content) {
                 append_log(
                     &mut state.borrow_mut(),
@@ -144,7 +171,17 @@ pub(crate) fn apply_desktop_actions(
 
     if let Some(path) = autostart_desktop_path(&access.profile) {
         if autostart_enabled {
-            let content = desktop_entry(&exec_path, &icon_path, &access.profile, true, false);
+            let content = match desktop_entry(&exec_path, &icon_path, &access.profile, true, false)
+            {
+                Ok(content) => content,
+                Err(err) => {
+                    append_log(
+                        &mut state.borrow_mut(),
+                        format!("Failed to build system autostart entry: {err}"),
+                    );
+                    return;
+                }
+            };
             if let Err(err) = write_desktop_file(&path, &content) {
                 append_log(
                     &mut state.borrow_mut(),
@@ -228,26 +265,87 @@ fn bundled_icon_path() -> Option<PathBuf> {
         .map(|proj| proj.data_local_dir().join(BUNDLED_ICON_FILE_NAME))
 }
 
+fn validate_icon_dimensions(width: u32, height: u32) -> Result<(), String> {
+    if width == 0 || height == 0 {
+        return Err("icon image has invalid zero dimensions".to_string());
+    }
+
+    let pixel_count = u64::from(width) * u64::from(height);
+    if width > MAX_ICON_DIMENSION || height > MAX_ICON_DIMENSION || pixel_count > MAX_ICON_PIXELS {
+        return Err(format!(
+            "icon image dimensions {width}x{height} exceed maximum {MAX_ICON_DIMENSION}x{MAX_ICON_DIMENSION}"
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_icon_bytes(bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() > MAX_ICON_FILE_BYTES {
+        return Err(format!(
+            "icon file exceeds maximum size of {MAX_ICON_FILE_BYTES} bytes"
+        ));
+    }
+
+    let reader = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|err| format!("invalid icon image: {err}"))?;
+    let (width, height) = reader
+        .into_dimensions()
+        .map_err(|err| format!("invalid icon image: {err}"))?;
+    validate_icon_dimensions(width, height)
+}
+
+fn read_validated_icon_file(path: &Path) -> Result<Vec<u8>, String> {
+    let metadata = fs::metadata(path).map_err(|err| format!("unable to stat icon file: {err}"))?;
+    let file_size = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+    if file_size > MAX_ICON_FILE_BYTES {
+        return Err(format!(
+            "icon file exceeds maximum size of {MAX_ICON_FILE_BYTES} bytes"
+        ));
+    }
+
+    let bytes = fs::read(path).map_err(|err| format!("unable to read icon file: {err}"))?;
+    validate_icon_bytes(&bytes)?;
+    Ok(bytes)
+}
+
+fn decode_bounded_icon(bytes: &[u8]) -> Result<RgbaImage, String> {
+    validate_icon_bytes(bytes)?;
+    image::load_from_memory(bytes)
+        .map(|image| image.to_rgba8())
+        .map_err(|err| format!("invalid icon image: {err}"))
+}
+
 pub(crate) fn copy_icon_to_profile(source_path: &Path, profile: &str) -> Result<PathBuf, String> {
-    let bytes = fs::read(source_path).map_err(|err| format!("unable to read icon file: {err}"))?;
-    image::load_from_memory(&bytes).map_err(|err| format!("invalid icon image: {err}"))?;
+    let bytes = read_validated_icon_file(source_path)?;
 
     let target_path = profile_icon_path(profile)
         .ok_or_else(|| "unable to resolve icon storage path".to_string())?;
     if let Some(parent) = target_path.parent() {
-        fs::create_dir_all(parent).map_err(|err| format!("unable to create icon dir: {err}"))?;
+        ensure_private_directory(parent)
+            .map_err(|err| format!("unable to create icon dir: {err}"))?;
     }
-    fs::write(&target_path, bytes).map_err(|err| format!("unable to store icon copy: {err}"))?;
+    let mut file = create_private_file(&target_path)
+        .map_err(|err| format!("unable to store icon copy: {err}"))?;
+    file.write_all(&bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|err| format!("unable to store icon copy: {err}"))?;
     Ok(target_path)
 }
 
 fn ensure_bundled_icon_file() -> Result<PathBuf, std::io::Error> {
     let icon_path = bundled_icon_path()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "project dirs"))?;
+    validate_icon_bytes(include_bytes!("../assets/icon.png"))
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
     if let Some(parent) = icon_path.parent() {
-        fs::create_dir_all(parent)?;
+        ensure_private_directory(parent)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::PermissionDenied, err))?;
     }
-    fs::write(&icon_path, include_bytes!("../assets/icon.png"))?;
+    let mut file = create_private_file(&icon_path)?;
+    file.write_all(include_bytes!("../assets/icon.png"))?;
+    file.sync_all()?;
     Ok(icon_path)
 }
 
@@ -255,15 +353,44 @@ pub(crate) fn resolve_icon_path_for_desktop(config: &Config) -> Result<PathBuf, 
     if let Some(path) = config.icon_path.as_ref() {
         let icon = PathBuf::from(path);
         if icon.exists() {
-            return Ok(icon);
+            match read_validated_icon_file(&icon) {
+                Ok(_) => return Ok(icon),
+                Err(err) => eprintln!(
+                    "failed to validate desktop icon at {}: {err}. falling back to bundled icon",
+                    icon.display()
+                ),
+            }
         }
     }
     ensure_bundled_icon_file()
 }
 
 pub(crate) fn load_window_icon_pixbuf(config: &Config) -> Option<Pixbuf> {
-    let icon_path = resolve_icon_path_for_desktop(config).ok()?;
-    Pixbuf::from_file(icon_path).ok()
+    let bytes = if let Some(path) = config.icon_path.as_ref() {
+        let icon_path = PathBuf::from(path);
+        if icon_path.exists() {
+            match read_validated_icon_file(&icon_path) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    eprintln!(
+                        "failed to validate window icon at {}: {err}. falling back to bundled icon",
+                        icon_path.display()
+                    );
+                    include_bytes!("../assets/icon.png").to_vec()
+                }
+            }
+        } else {
+            include_bytes!("../assets/icon.png").to_vec()
+        }
+    } else {
+        include_bytes!("../assets/icon.png").to_vec()
+    };
+
+    validate_icon_bytes(&bytes).ok()?;
+    let loader = PixbufLoader::new();
+    loader.write(&bytes).ok()?;
+    loader.close().ok()?;
+    loader.pixbuf()
 }
 
 #[derive(Debug, Clone)]
@@ -294,11 +421,8 @@ pub(crate) fn resolve_tray_icon(
     if let Some(path) = config.icon_path.as_ref() {
         let icon_path = PathBuf::from(path);
         if icon_path.exists() {
-            match fs::read(&icon_path)
-                .map_err(|err| err.to_string())
-                .and_then(|bytes| image::load_from_memory(&bytes).map_err(|err| err.to_string()))
-            {
-                Ok(image) => return Ok(resolved_tray_icon_from_image(image.to_rgba8())),
+            match read_validated_icon_file(&icon_path).and_then(|bytes| decode_bounded_icon(&bytes)) {
+                Ok(image) => return Ok(resolved_tray_icon_from_image(image)),
                 Err(err) => eprintln!(
                     "failed to load profile icon at {}: {err}. falling back to bundled icon",
                     icon_path.display()
@@ -307,8 +431,10 @@ pub(crate) fn resolve_tray_icon(
         }
     }
 
-    let image = image::load_from_memory(include_bytes!("../assets/icon.png"))?;
-    Ok(resolved_tray_icon_from_image(image.to_rgba8()))
+    let image = decode_bounded_icon(include_bytes!("../assets/icon.png")).map_err(|err| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, err)
+    })?;
+    Ok(resolved_tray_icon_from_image(image))
 }
 
 pub(crate) fn rgba_to_argb_in_place(bytes: &mut [u8]) {
@@ -342,21 +468,33 @@ pub(crate) fn desktop_entry(
     profile: &str,
     autostart: bool,
     no_display: bool,
-) -> String {
+) -> Result<String, String> {
     let mut entry = String::from("[Desktop Entry]\n");
     entry.push_str("Type=Application\n");
 
     let display_name = format!("{} ({APP_NAME})", sanitize_profile_name(profile));
+    validate_desktop_entry_value("Name", &display_name)?;
     entry.push_str(&format!("Name={display_name}\n"));
+
+    let exec_path = exec_path.to_string_lossy();
+    validate_desktop_entry_value("Exec", exec_path.as_ref())?;
+    validate_desktop_entry_value("Exec", profile)?;
 
     let exec = format!(
         "{} --config {}",
-        desktop_escape_arg(&exec_path.to_string_lossy()),
+        desktop_escape_arg(exec_path.as_ref()),
         desktop_escape_arg(profile)
     );
+    validate_desktop_entry_value("Exec", &exec)?;
+
+    let icon_value = icon_path.to_string_lossy();
+    validate_desktop_entry_value("Icon", icon_value.as_ref())?;
     entry.push_str(&format!("Exec={exec}\n"));
-    entry.push_str(&format!("Icon={}\n", icon_path.to_string_lossy()));
-    entry.push_str(&format!("StartupWMClass={}\n", app_id_for_profile(profile)));
+    entry.push_str(&format!("Icon={}\n", icon_value));
+
+    let startup_wm_class = app_id_for_profile(profile);
+    validate_desktop_entry_value("StartupWMClass", &startup_wm_class)?;
+    entry.push_str(&format!("StartupWMClass={startup_wm_class}\n"));
     if no_display {
         entry.push_str("NoDisplay=true\n");
     }
@@ -365,7 +503,7 @@ pub(crate) fn desktop_entry(
     if autostart {
         entry.push_str("X-GNOME-Autostart-enabled=true\n");
     }
-    entry
+    Ok(entry)
 }
 
 pub(crate) fn desktop_entry_is_visible(contents: &str) -> bool {
@@ -395,9 +533,17 @@ pub(crate) fn ensure_hidden_identity_desktop_file(
         }
     };
 
-    let contents = desktop_entry(&exec_path, &icon_path, profile, false, no_display);
+    let contents = desktop_entry(&exec_path, &icon_path, profile, false, no_display)?;
     write_desktop_file(&desktop_path, &contents)?;
     Ok(desktop_path)
+}
+
+fn validate_desktop_entry_value(field: &str, value: &str) -> Result<(), String> {
+    if value.chars().any(char::is_control) {
+        return Err(format!("desktop entry {field} contains control characters"));
+    }
+
+    Ok(())
 }
 
 fn desktop_escape_arg(value: &str) -> String {
@@ -422,5 +568,5 @@ fn desktop_escape_arg(value: &str) -> String {
 }
 
 fn write_desktop_file(path: &Path, contents: &str) -> Result<(), String> {
-    atomic_write(path, contents)
+    atomic_write_shared(path, contents)
 }

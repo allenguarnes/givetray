@@ -14,6 +14,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
+const MAX_CHILD_OUTPUT_LINE_BYTES: usize = 16 * 1024;
+const CHILD_OUTPUT_TRUNCATION_SUFFIX: &str = " … [truncated child output]";
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct BoundedLine {
+    pub(crate) text: String,
+    pub(crate) truncated: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeReconcileResult {
     RestoreRunning,
@@ -311,6 +320,64 @@ fn flush_dropped_lines_blocking(ui_tx: &Sender<UiEvent>, dropped_lines: &mut usi
     }
 }
 
+fn append_child_output_chunk(
+    line: &mut Vec<u8>,
+    chunk: &[u8],
+    max_bytes: usize,
+    truncated: &mut bool,
+) {
+    let remaining = max_bytes.saturating_sub(line.len());
+    let keep = remaining.min(chunk.len());
+    line.extend_from_slice(&chunk[..keep]);
+    if keep < chunk.len() {
+        *truncated = true;
+    }
+}
+
+fn finalize_bounded_line(mut bytes: Vec<u8>, truncated: bool) -> BoundedLine {
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if truncated {
+        text.push_str(CHILD_OUTPUT_TRUNCATION_SUFFIX);
+    }
+
+    BoundedLine { text, truncated }
+}
+
+pub(crate) fn read_bounded_line<R: BufRead>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> Result<Option<BoundedLine>, std::io::Error> {
+    let mut line = Vec::new();
+    let mut truncated = false;
+
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            if line.is_empty() && !truncated {
+                return Ok(None);
+            }
+            return Ok(Some(finalize_bounded_line(line, truncated)));
+        }
+
+        let newline_pos = available.iter().position(|byte| *byte == b'\n');
+        let newline_len = newline_pos.map(|idx| idx + 1).unwrap_or(available.len());
+
+        append_child_output_chunk(&mut line, &available[..newline_len], max_bytes, &mut truncated);
+        reader.consume(newline_len);
+
+        if newline_pos.is_some() {
+            return Ok(Some(finalize_bounded_line(line, truncated)));
+        }
+    }
+}
+
 pub(crate) fn start_command(state: Rc<RefCell<AppState>>, ui_tx: Sender<UiEvent>) {
     if !can_control_profile(
         state.borrow().persistent_config_access.as_ref(),
@@ -509,12 +576,12 @@ pub(crate) fn stop_command_blocking(state: Rc<RefCell<AppState>>) {
 
 fn spawn_reader<R: std::io::Read + Send + 'static>(reader: R, ui_tx: Sender<UiEvent>) {
     thread::spawn(move || {
-        let buf = BufReader::new(reader);
+        let mut buf = BufReader::new(reader);
         let mut dropped_lines = 0usize;
 
-        for line in buf.lines() {
-            match line {
-                Ok(line) => {
+        loop {
+            match read_bounded_line(&mut buf, MAX_CHILD_OUTPUT_LINE_BYTES) {
+                Ok(Some(line)) => {
                     if dropped_lines > 0 {
                         match ui_tx.try_send(UiEvent::AppendLog(coalesced_log_overflow_message(
                             dropped_lines,
@@ -528,12 +595,13 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(reader: R, ui_tx: Sender<UiEv
                         }
                     }
 
-                    match ui_tx.try_send(UiEvent::AppendLog(line)) {
+                    match ui_tx.try_send(UiEvent::AppendLog(line.text)) {
                         Ok(()) => {}
                         Err(async_channel::TrySendError::Full(_)) => dropped_lines += 1,
                         Err(async_channel::TrySendError::Closed(_)) => break,
                     }
                 }
+                Ok(None) => break,
                 Err(err) => {
                     flush_dropped_lines_blocking(&ui_tx, &mut dropped_lines);
 
@@ -733,6 +801,7 @@ fn prompt_sudo_password() -> Option<Zeroizing<String>> {
         None
     };
 
+    password_entry.set_text("");
     dialog.close();
     password
 }
